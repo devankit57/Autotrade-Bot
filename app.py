@@ -9,10 +9,12 @@ from binance.um_futures import UMFutures        # type: ignore
 from binance.error import ClientError           # type: ignore
 from decimal import Decimal, getcontext, ROUND_DOWN
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pymongo import MongoClient
 from apscheduler.schedulers.background import BackgroundScheduler
 
 getcontext().prec = 12
+IST = ZoneInfo("Asia/Kolkata")
 
 app = Flask(__name__)
 CORS(app)
@@ -66,7 +68,7 @@ def round_quantity(qty: Decimal, precision: int) -> Decimal:
 
 def mark_failed(task_id: str, msg: str):
     status_logs.update_one({"task_id": task_id},
-        {"$set": {"status": "FAILED","error_message": msg,"end_time": datetime.utcnow()}})
+        {"$set": {"status": "FAILED","error_message": msg,"end_time": datetime.now(IST)}})
     task_results[task_id] = {"status": "FAILED", "error_message": msg}
     app.logger.error(f"Trade {task_id} FAILED: {msg}")
 
@@ -125,7 +127,7 @@ def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, cal
             }
             task_results[task_id] = result
             status_logs.update_one({"task_id": task_id},
-                {"$set": {**result, "end_time": datetime.utcnow()}})
+                {"$set": {**result, "end_time": datetime.now(IST)}})
             if callback_url:
                 try: requests.post(callback_url, json={"task_id":task_id,**result},timeout=10)
                 except: pass
@@ -148,7 +150,7 @@ def poll_predict_and_trade(job_id: str):
         payload["symbol"] = pred["signal"]
         r = requests.post("http://localhost:5000/trade", json=payload)
         if r.status_code in (200, 202):
-            meta["executed_trades"].append(datetime.utcnow().isoformat()+"Z")
+            meta["executed_trades"].append(datetime.now(IST).isoformat())
 
 # ── API Endpoints ───────────────────────────────────────
 @app.route("/trade", methods=["POST"])
@@ -189,7 +191,7 @@ def start_trade():
         "task_id": task_id, "email": data["email"], "symbol": symbol,
         "quantity": str(qty), "profit_pct": str(profit_pct),
         "loss_pct": str(loss_pct), "leverage": lev,
-        "entry_price": str(ep), "status": "RUNNING", "start_time": datetime.utcnow()
+        "entry_price": str(ep), "status": "RUNNING", "start_time": datetime.now(IST)
     })
 
     threading.Thread(target=auto_trade,
@@ -231,7 +233,7 @@ def cancel_by_email():
     for t in tids:
         cancel_flags[t] = True
     status_logs.update_many({"task_id": {"$in": tids}},
-                            {"$set": {"status": "CANCEL_REQUESTED", "cancel_time": datetime.utcnow()}})
+                            {"$set": {"status": "CANCEL_REQUESTED", "cancel_time": datetime.now(IST)}})
 
     return jsonify({"email": email, "cancelled": tids,
                     "message": f"Requested cancellation for {len(tids)}"}), 202
@@ -248,7 +250,7 @@ def start_auto_trade():
     job_id = str(uuid.uuid4())
 
     job = scheduler.add_job(func=poll_predict_and_trade, trigger="interval",
-                            minutes=15, next_run_time=datetime.utcnow(), args=[job_id], id=job_id)
+                            minutes=15, next_run_time=datetime.now(IST), args=[job_id], id=job_id)
 
     auto_jobs[job_id] = {
         "job": job,
@@ -260,7 +262,7 @@ def start_auto_trade():
 
     return jsonify({"job_id": job_id,
                     "message": "Auto-trade started",
-                    "next_run_time": job.next_run_time.isoformat() + "Z"}), 202
+                    "next_run_time": job.next_run_time.isoformat()}), 202
 
 @app.route("/auto_trade_status/<job_id>", methods=["GET"])
 def auto_trade_status(job_id):
@@ -269,7 +271,7 @@ def auto_trade_status(job_id):
         return jsonify({"error": "Job not found"}), 404
     return jsonify({
         "job_id": job_id,
-        "next_run_time": meta["job"].next_run_time.isoformat() + "Z",
+        "next_run_time": meta["job"].next_run_time.isoformat(),
         "last_prediction": meta["last_prediction"],
         "executed_trades": meta["executed_trades"]
     }), 200
@@ -280,10 +282,9 @@ def get_price():
     try:
         data = requests.get(f"https://testnet.binance.vision/api/v3/ticker/price?symbol={sym}").json()
         price = Decimal(data["price"])
-        return jsonify({"symbol": sym, "price": str(price), "timestamp": datetime.utcnow().isoformat() + "Z"}), 200
+        return jsonify({"symbol": sym, "price": str(price), "timestamp": datetime.now(IST).isoformat()}), 200
     except:
         return jsonify({"error": "Price fetch failed"}), 500
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5001)))
-
