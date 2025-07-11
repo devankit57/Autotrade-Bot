@@ -19,7 +19,7 @@ app = Flask(__name__)
 CORS(app)
 
 # ── MongoDB setup ─────────────────────────────────────────────────────────────
-MONGO_URI    = os.environ.get("MONGO_URI", "mongodb+srv://<user>:<pass>@cluster0/?retryWrites=true")
+MONGO_URI = "mongodb+srv://netmanconnect:eDxdS7AkkimNGJdi@cluster0.exzvao3.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 mongo_client = MongoClient(MONGO_URI)
 db           = mongo_client["mttrader"]
 status_logs  = db["trades"]
