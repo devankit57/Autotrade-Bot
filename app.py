@@ -148,7 +148,7 @@ def poll_predict_and_trade(job_id: str):
     if pred.get("confidence", 0) >= meta["threshold"]:
         payload = meta["trade_params"].copy()
         payload["symbol"] = pred["signal"]
-        r = requests.post("http://localhost:5000/trade", json=payload)
+        r = requests.post("http://13.203.202.106:5001/trade", json=payload)
         if r.status_code in (200, 202):
             meta["executed_trades"].append(datetime.now(IST).isoformat())
 
