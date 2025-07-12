@@ -73,7 +73,7 @@ def mark_failed(task_id: str, msg: str):
     app.logger.error(f"Trade {task_id} FAILED: {msg}")
 
 # ── Core Trading ─────────────────────────────────────────
-def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, callback_url=None, max_steps=3600000):
+def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, callback_url=None, direction="BUY"):
     try:
         entry_price = fetch_price_with_retries(client, symbol)
     except Exception as e:
@@ -84,12 +84,16 @@ def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, cal
     except Exception as e:
         return mark_failed(task_id, f"Leverage error: {e}")
 
+    entry_side = direction.upper()
+    exit_side = "SELL" if entry_side == "BUY" else "BUY"
+
     try:
-        client.new_order(symbol=symbol, side='BUY', type='MARKET', quantity=str(qty))
+        client.new_order(symbol=symbol, side=entry_side, type='MARKET', quantity=str(qty))
     except Exception as e:
-        return mark_failed(task_id, f"Buy failed: {e}")
+        return mark_failed(task_id, f"{entry_side} failed: {e}")
 
     step = 0
+    max_steps = 3600000
     while True:
         if cancel_flags.get(task_id):
             exit_reason = "CANCELLED_BY_USER"
@@ -99,7 +103,7 @@ def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, cal
             except Exception as e:
                 return mark_failed(task_id, str(e))
 
-            pnl_pct = (price - entry_price) / entry_price * Decimal("100")
+            pnl_pct = ((price - entry_price) / entry_price * Decimal("100")) if entry_side == "BUY" else ((entry_price - price) / entry_price * Decimal("100"))
             exit_reason = None
             if pnl_pct >= profit_pct:
                 exit_reason = "COMPLETED"
@@ -110,12 +114,11 @@ def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, cal
 
         if exit_reason:
             try:
-                client.new_order(symbol=symbol, side='SELL', type='MARKET',
-                                 quantity=str(qty), reduceOnly=True)
+                client.new_order(symbol=symbol, side=exit_side, type='MARKET', quantity=str(qty), reduceOnly=True)
             except Exception as e:
-                return mark_failed(task_id, f"Sell error: {e}")
+                return mark_failed(task_id, f"{exit_side} error: {e}")
 
-            pnl_amt = (price - entry_price) * qty
+            pnl_amt = (price - entry_price) * qty if entry_side == "BUY" else (entry_price - price) * qty
             result = {
                 "status": exit_reason,
                 "symbol": symbol,
@@ -146,8 +149,16 @@ def poll_predict_and_trade(job_id: str):
     meta["last_prediction"] = pred.copy()
 
     if pred.get("confidence", 0) >= meta["threshold"]:
+        signal_text = pred.get("signal", "").upper()
+        direction = "BUY" if "BUY" in signal_text else "SELL" if "SELL" in signal_text else None
+        if not direction:
+            app.logger.warning(f"Unknown signal format: {signal_text}")
+            return
+        
         payload = meta["trade_params"].copy()
-        payload["symbol"] = pred["signal"]
+        payload["symbol"] = payload["symbol"]
+        payload["direction"] = direction
+
         r = requests.post("http://13.203.202.106:5001/trade", json=payload)
         if r.status_code in (200, 202):
             meta["executed_trades"].append(datetime.now(IST).isoformat())
@@ -168,10 +179,12 @@ def start_trade():
     except Exception as e:
         return jsonify({"error": str(e)}), 401
 
-    symbol, lev = data["symbol"], int(data["leverage"])
+    symbol = data["symbol"]
+    lev = int(data["leverage"])
     profit_pct = Decimal(str(data["profit_percent"]))
     loss_pct = Decimal(str(data["loss_percent"]))
     callback = data.get("callback_url")
+    direction = data.get("direction", "BUY").upper()
 
     try:
         ep = fetch_price_with_retries(client, symbol)
@@ -195,7 +208,7 @@ def start_trade():
     })
 
     threading.Thread(target=auto_trade,
-                     args=(client, symbol, qty, profit_pct, loss_pct, lev, task_id, callback),
+                     args=(client, symbol, qty, profit_pct, loss_pct, lev, task_id, callback, direction),
                      daemon=True).start()
 
     return jsonify({
@@ -241,11 +254,11 @@ def cancel_by_email():
 @app.route("/start_auto_trade", methods=["POST"])
 def start_auto_trade():
     d = request.get_json(force=True)
-    missing = [f for f in ("email", "quantity", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret", "threshold") if f not in d]
+    missing = [f for f in ("email", "quantity", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret", "threshold", "symbol") if f not in d]
     if missing:
         return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
 
-    trade_params = {k: d[k] for k in ("email", "quantity", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret")}
+    trade_params = {k: d[k] for k in ("email", "quantity", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret", "symbol")}
     threshold = float(d["threshold"])
     job_id = str(uuid.uuid4())
 
