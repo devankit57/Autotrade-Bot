@@ -3,12 +3,12 @@ import time
 import uuid
 import threading
 import requests
-from flask import Flask, request, jsonify 
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from binance.um_futures import UMFutures        # type: ignore
-from binance.error import ClientError           # type: ignore
+from binance.um_futures import UMFutures  # type: ignore
+from binance.error import ClientError    # type: ignore
 from decimal import Decimal, getcontext, ROUND_DOWN
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from pymongo import MongoClient
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -19,22 +19,23 @@ IST = ZoneInfo("Asia/Kolkata")
 app = Flask(__name__)
 CORS(app)
 
-# MongoDB setup
-MONGO_URI = "mongodb+srv://netmanconnect:eDxdS7AkkimNGJdi@cluster0.exzvao3.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+MONGO_URI = os.getenv("MONGO_URI", "your-mongo-uri-here")
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["mttrader"]
 status_logs = db["trades"]
+daily_stats = db["daily_stats"]
 
 task_results = {}
 cancel_flags = {}
-
 auto_jobs = {}
+
 scheduler = BackgroundScheduler()
 scheduler.start()
 
 BINANCE_TESTNET_URL = "https://testnet.binancefuture.com"
 
 # ── Helpers ──────────────────────────────────────────────
+
 def fetch_price_with_retries(client, symbol: str, retries: int = 3, delay: float = 1.0) -> Decimal:
     for attempt in range(1, retries + 1):
         try:
@@ -52,7 +53,8 @@ def get_available_balance(client) -> Decimal:
     raise ValueError("USDT balance not found")
 
 def get_symbol_filters(client, symbol: str):
-    for s in client.exchange_info()['symbols']:
+    info = client.exchange_info()
+    for s in info['symbols']:
         if s['symbol'] == symbol:
             for f in s['filters']:
                 if f['filterType'] == 'LOT_SIZE':
@@ -63,17 +65,38 @@ def get_symbol_filters(client, symbol: str):
     raise ValueError(f"No filters for {symbol}")
 
 def round_quantity(qty: Decimal, precision: int) -> Decimal:
-    fmt = '1.' + '0'*precision
+    fmt = '1.' + '0' * precision
     return qty.quantize(Decimal(fmt), rounding=ROUND_DOWN)
 
 def mark_failed(task_id: str, msg: str):
     status_logs.update_one({"task_id": task_id},
-        {"$set": {"status": "FAILED","error_message": msg,"end_time": datetime.now(IST)}})
+                          {"$set": {"status": "FAILED", "error_message": msg, "end_time": datetime.now(IST)}})
     task_results[task_id] = {"status": "FAILED", "error_message": msg}
     app.logger.error(f"Trade {task_id} FAILED: {msg}")
 
-# ── Core Trading ─────────────────────────────────────────
-def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, callback_url=None, direction="BUY"):
+def update_daily_stats(email: str, pnl_pct: Decimal):
+    today = date.today().isoformat()
+    doc = daily_stats.find_one({"email": email, "date": today})
+    if not doc:
+        doc = {"email": email, "date": today, "total_profit_pct": 0.0, "total_loss_pct": 0.0, "is_locked": False}
+    if pnl_pct > 0:
+        doc["total_profit_pct"] += float(pnl_pct)
+    else:
+        doc["total_loss_pct"] += abs(float(pnl_pct))
+    if doc["total_profit_pct"] >= 3.0 or doc["total_loss_pct"] >= 2.0:
+        doc["is_locked"] = True
+    daily_stats.update_one({"email": email, "date": today}, {"$set": doc}, upsert=True)
+
+def reset_daily_locks():
+    today = date.today().isoformat()
+    daily_stats.update_many({"date": {"$ne": today}},
+                            {"$set": {"total_profit_pct": 0.0, "total_loss_pct": 0.0, "is_locked": False, "date": today}})
+
+scheduler.add_job(func=reset_daily_locks, trigger="cron", hour=0, minute=0)
+
+# ── Core Trading Function ───────────────────────────────
+
+def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, callback_url=None, direction="BUY", email=None):
     try:
         entry_price = fetch_price_with_retries(client, symbol)
     except Exception as e:
@@ -93,7 +116,8 @@ def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, cal
         return mark_failed(task_id, f"{entry_side} failed: {e}")
 
     step = 0
-    max_steps = 3600000
+    max_steps = 3600
+
     while True:
         if cancel_flags.get(task_id):
             exit_reason = "CANCELLED_BY_USER"
@@ -103,7 +127,8 @@ def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, cal
             except Exception as e:
                 return mark_failed(task_id, str(e))
 
-            pnl_pct = ((price - entry_price) / entry_price * Decimal("100")) if entry_side == "BUY" else ((entry_price - price) / entry_price * Decimal("100"))
+            pnl_pct = ((price - entry_price) / entry_price * Decimal("100")) if entry_side == "BUY" \
+                      else ((entry_price - price) / entry_price * Decimal("100"))
             exit_reason = None
             if pnl_pct >= profit_pct:
                 exit_reason = "COMPLETED"
@@ -119,21 +144,21 @@ def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, cal
                 return mark_failed(task_id, f"{exit_side} error: {e}")
 
             pnl_amt = (price - entry_price) * qty if entry_side == "BUY" else (entry_price - price) * qty
-            result = {
-                "status": exit_reason,
-                "symbol": symbol,
-                "entry_price": str(entry_price),
-                "exit_price": str(price),
-                "pnl_amount": str(pnl_amt),
-                "pnl_percent": str(pnl_pct),
-                "ledger_balance": "N/A"
-            }
+            result = {"status": exit_reason, "symbol": symbol, "entry_price": str(entry_price),
+                      "exit_price": str(price), "pnl_amount": str(pnl_amt), "pnl_percent": str(pnl_pct),
+                      "ledger_balance": "N/A"}
             task_results[task_id] = result
-            status_logs.update_one({"task_id": task_id},
-                {"$set": {**result, "end_time": datetime.now(IST)}})
+            status_logs.update_one({"task_id": task_id}, {"$set": {**result, "end_time": datetime.now(IST)}})
+
+            if email:
+                update_daily_stats(email, pnl_pct)
+
             if callback_url:
-                try: requests.post(callback_url, json={"task_id":task_id,**result},timeout=10)
-                except: pass
+                try:
+                    requests.post(callback_url, json={"task_id": task_id, **result}, timeout=10)
+                except:
+                    pass
+
             cancel_flags.pop(task_id, None)
             break
 
@@ -141,56 +166,45 @@ def auto_trade(client, symbol, qty, profit_pct, loss_pct, leverage, task_id, cal
         time.sleep(1)
 
 # ── Auto-Trade Worker ───────────────────────────────────
+
 def poll_predict_and_trade(job_id: str):
     meta = auto_jobs[job_id]
     resp = requests.get("http://13.203.202.106:5000/predict")
     resp.raise_for_status()
     pred = resp.json()
     meta["last_prediction"] = pred.copy()
-
     if pred.get("confidence", 0) >= meta["threshold"]:
-        signal_text = pred.get("signal", "").upper()
-        direction = "BUY" if "BUY" in signal_text else "SELL" if "SELL" in signal_text else None
+        text = pred.get("signal", "").upper()
+        direction = "BUY" if "BUY" in text else "SELL" if "SELL" in text else None
         if not direction:
-            app.logger.warning(f"Unknown signal format: {signal_text}")
+            app.logger.warning(f"Unknown signal: {text}")
             return
-        
         payload = meta["trade_params"].copy()
-        payload["symbol"] = payload["symbol"]
         payload["direction"] = direction
-
         r = requests.post("http://13.203.202.106:5001/trade", json=payload)
         if r.status_code in (200, 202):
             meta["executed_trades"].append(datetime.now(IST).isoformat())
 
 # ── API Endpoints ───────────────────────────────────────
+
 @app.route("/trade", methods=["POST"])
 def start_trade():
     data = request.get_json(force=True)
-    for f in ["email", "symbol", "quantity", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret"]:
+    for f in ["email", "symbol", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret"]:
         if f not in data:
             return jsonify({"error": f"Missing field: {f}"}), 400
-    try:
-        client = UMFutures(
-            key=data["api_key"],
-            secret=data["api_secret"],
-            base_url=BINANCE_TESTNET_URL
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 401
 
-    symbol = data["symbol"]
-    lev = int(data["leverage"])
-    profit_pct = Decimal(str(data["profit_percent"]))
-    loss_pct = Decimal(str(data["loss_percent"]))
-    callback = data.get("callback_url")
-    direction = data.get("direction", "BUY").upper()
+    today = date.today().isoformat()
+    doc = daily_stats.find_one({"email": data["email"], "date": today})
+    if doc and doc.get("is_locked"):
+        return jsonify({"error": "Trading blocked for today (daily limit hit)"}), 403
 
     try:
-        ep = fetch_price_with_retries(client, symbol)
+        client = UMFutures(key=data["api_key"], secret=data["api_secret"], base_url=BINANCE_TESTNET_URL)
+        ep = fetch_price_with_retries(client, data["symbol"])
         bal = get_available_balance(client)
-        filt = get_symbol_filters(client, symbol)
-        raw = bal * lev / ep * Decimal("0.95")
+        filt = get_symbol_filters(client, data["symbol"])
+        raw = bal * int(data["leverage"]) / ep * Decimal("0.95")
         qty = round_quantity(raw, filt["precision"])
         if qty < filt["min_qty"]:
             return jsonify({"error": f"qty {qty} below min"}), 400
@@ -201,20 +215,19 @@ def start_trade():
     task_results[task_id] = {"status": "RUNNING"}
     cancel_flags[task_id] = False
     status_logs.insert_one({
-        "task_id": task_id, "email": data["email"], "symbol": symbol,
-        "quantity": str(qty), "profit_pct": str(profit_pct),
-        "loss_pct": str(loss_pct), "leverage": lev,
+        "task_id": task_id, "email": data["email"], "symbol": data["symbol"],
+        "quantity": str(qty), "profit_pct": str(data["profit_percent"]),
+        "loss_pct": str(data["loss_percent"]), "leverage": int(data["leverage"]),
         "entry_price": str(ep), "status": "RUNNING", "start_time": datetime.now(IST)
     })
 
     threading.Thread(target=auto_trade,
-                     args=(client, symbol, qty, profit_pct, loss_pct, lev, task_id, callback, direction),
+                     args=(client, data["symbol"], qty, Decimal(str(data["profit_percent"])),
+                           Decimal(str(data["loss_percent"])), int(data["leverage"]), task_id,
+                           data.get("callback_url"), data.get("direction", "BUY").upper(), data["email"]),
                      daemon=True).start()
 
-    return jsonify({
-        "task_id": task_id, "status": "STARTED",
-        "entry_price": str(ep), "quantity": str(qty), "leverage": lev
-    }), 202
+    return jsonify({"task_id": task_id, "status": "STARTED", "entry_price": str(ep), "quantity": str(qty), "leverage": int(data["leverage"])}), 202
 
 @app.route("/status/<task_id>", methods=["GET"])
 def get_status(task_id):
@@ -237,57 +250,31 @@ def cancel_by_email():
     email = data.get("email")
     if not email:
         return jsonify({"error": "Missing field: email"}), 400
-
     docs = status_logs.find({"email": email, "status": "RUNNING"}, {"task_id": 1})
     tids = [d["task_id"] for d in docs]
-    if not tids:
-        return jsonify({"email": email, "cancelled": [], "message": "No running trades"}), 200
-
-    for t in tids:
-        cancel_flags[t] = True
-    status_logs.update_many({"task_id": {"$in": tids}},
-                            {"$set": {"status": "CANCEL_REQUESTED", "cancel_time": datetime.now(IST)}})
-
-    return jsonify({"email": email, "cancelled": tids,
-                    "message": f"Requested cancellation for {len(tids)}"}), 202
+    for t in tids: cancel_flags[t] = True
+    status_logs.update_many({"task_id": {"$in": tids}}, {"$set": {"status": "CANCEL_REQUESTED", "cancel_time": datetime.now(IST)}})
+    return jsonify({"email": email, "cancelled": tids, "message": f"Requested cancellation for {len(tids)}"}), 202
 
 @app.route("/start_auto_trade", methods=["POST"])
 def start_auto_trade():
     d = request.get_json(force=True)
-    missing = [f for f in ("email", "quantity", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret", "threshold", "symbol") if f not in d]
+    missing = [f for f in ("email", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret", "threshold", "symbol") if f not in d]
     if missing:
         return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
-
-    trade_params = {k: d[k] for k in ("email", "quantity", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret", "symbol")}
+    trade_params = {k: d[k] for k in ("email", "profit_percent", "loss_percent", "leverage", "api_key", "api_secret", "symbol")}
     threshold = float(d["threshold"])
     job_id = str(uuid.uuid4())
-
-    job = scheduler.add_job(func=poll_predict_and_trade, trigger="interval",
-                            minutes=15, next_run_time=datetime.now(IST), args=[job_id], id=job_id)
-
-    auto_jobs[job_id] = {
-        "job": job,
-        "threshold": threshold,
-        "trade_params": trade_params,
-        "last_prediction": None,
-        "executed_trades": []
-    }
-
-    return jsonify({"job_id": job_id,
-                    "message": "Auto-trade started",
-                    "next_run_time": job.next_run_time.isoformat()}), 202
+    job = scheduler.add_job(func=poll_predict_and_trade, trigger="interval", minutes=15, next_run_time=datetime.now(IST), args=[job_id], id=job_id)
+    auto_jobs[job_id] = {"job": job, "threshold": threshold, "trade_params": trade_params, "last_prediction": None, "executed_trades": []}
+    return jsonify({"job_id": job_id, "message": "Auto-trade started", "next_run_time": job.next_run_time.isoformat()}), 202
 
 @app.route("/auto_trade_status/<job_id>", methods=["GET"])
 def auto_trade_status(job_id):
     meta = auto_jobs.get(job_id)
     if not meta:
         return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "job_id": job_id,
-        "next_run_time": meta["job"].next_run_time.isoformat(),
-        "last_prediction": meta["last_prediction"],
-        "executed_trades": meta["executed_trades"]
-    }), 200
+    return jsonify({"job_id": job_id, "next_run_time": meta["job"].next_run_time.isoformat(), "last_prediction": meta["last_prediction"], "executed_trades": meta["executed_trades"]}), 200
 
 @app.route("/price", methods=["GET"])
 def get_price():
