@@ -19,8 +19,12 @@ IST = ZoneInfo("Asia/Kolkata")
 app = Flask(__name__)
 CORS(app)
 
+# --- Environment Variables for Render ---
+MONGO_URI = os.getenv("MONGO_URI")
+BINANCE_TESTNET_URL = os.getenv("BINANCE_TESTNET_URL", "https://testnet.binancefuture.com")
+PORT = int(os.getenv("PORT", 5001))
+
 # MongoDB Setup
-MONGO_URI = "mongodb+srv://netmanconnect:eDxdS7AkkimNGJdi@cluster0.exzvao3.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["mttrader"]
 status_logs = db["trades"]
