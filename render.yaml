@@ -1,1 +1,15 @@
 
+services:
+  - type: web
+    name: mttrader-bot
+    env: python
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PORT
+        value: 5001
+      - key: MONGO_URI
+        value:mongodb+srv://netmanconnect:eDxdS7AkkimNGJdi@cluster0.exzvao3.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
+      - key: BINANCE_TESTNET_URL
+        value: https://testnet.binancefuture.com
