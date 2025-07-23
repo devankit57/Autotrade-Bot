@@ -312,9 +312,9 @@ def poll_predict_and_trade(job_id: str):
 
     try:
         if symbol == "BTCUSDT":
-            predict_url = "http://31.97.206.221:5000/predict"
+            predict_url = "http://65.1.107.244:5000/predict"
         elif symbol == "ETHUSDT":
-            predict_url = "http://31.97.206.221:5001/predict"
+            predict_url = "http://65.1.107.244:5001/predict"
         else:
             app.logger.warning(f"{job_id}: Unsupported symbol: {symbol}")
             return
