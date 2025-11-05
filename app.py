@@ -61,34 +61,55 @@ scheduler.start()
 # ──────────────────────────────────────────────
 # Logging Helper → writes to mttrader.logs
 # ──────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Logging Helper → writes to mttrader.logs (with email auto-capture)
+# ──────────────────────────────────────────────
+from flask import has_request_context, request, g
+
 def log_event(level: str, message: str, email: str = None, context: dict = None):
     """
     Store structured logs in MongoDB 'logs' collection.
-    Fields:
-      - timestamp (IST ISO)
-      - level (INFO|WARNING|ERROR|STARTUP|SHUTDOWN)
-      - message (string)
-      - email (optional, for per-user drill-down)
-      - context (dict)
+    Auto-detects email from current request (JSON body, query string, or Flask 'g')
+    if not provided explicitly.
     """
     try:
+        # Attempt auto-detection of email
+        if not email and has_request_context():
+            # Try from JSON body
+            try:
+                if request.is_json:
+                    data = request.get_json(silent=True)
+                    if data and "email" in data:
+                        email = data["email"]
+            except Exception:
+                pass
+            # Try from query parameters
+            if not email:
+                email = request.args.get("email")
+            # Try from Flask g (if previously stored)
+            if not email:
+                email = getattr(g, "email", None)
+
         entry = {
             "timestamp": datetime.now(IST).isoformat(),
             "level": str(level).upper(),
             "message": message,
-            "email": email,
+            "email": email or "UNKNOWN",
             "context": context or {},
         }
+
         logs_collection.insert_one(entry)
-        # Mirror to Flask logger
-        app.logger.info(f"[{entry['level']}] {message} | email={email} | ctx={entry['context']}")
+        app.logger.info(f"[{entry['level']}] {message} | email={entry['email']} | ctx={entry['context']}")
+
     except Exception as e:
         app.logger.error(f"Failed to write to Mongo logs: {e}")
 
 # Startup / shutdown logs
-log_event("STARTUP", "AutoTrade bot started successfully.")
+log_event("STARTUP", "AutoTrade bot started successfully.", email="SYSTEM")
+
 def _on_shutdown():
-    log_event("SHUTDOWN", "AutoTrade bot stopped gracefully.")
+    log_event("SHUTDOWN", "AutoTrade bot stopped gracefully.", email="SYSTEM")
+
 atexit.register(_on_shutdown)
 
 # Optional global error handler to ensure unhandled exceptions are logged
@@ -1095,3 +1116,4 @@ if __name__ == "__main__":
 
     # Production launch (debug=False).  Gunicorn will run this app object directly.
     app.run(debug=False, host="0.0.0.0", port=port)
+
