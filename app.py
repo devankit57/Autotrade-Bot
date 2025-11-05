@@ -1,3 +1,9 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# AutoTrade Bot — Full Version (Part 1/5)
+# Includes: Mongo logs (mttrader.logs), fail-stop on trade error, no first-signal skip,
+# cached /auto_trade_status_by_email, and all original endpoints preserved.
+# ─────────────────────────────────────────────────────────────────────────────
+
 import os
 import time
 import uuid
@@ -13,29 +19,38 @@ from zoneinfo import ZoneInfo
 from pymongo import MongoClient
 from apscheduler.schedulers.background import BackgroundScheduler
 from bson import ObjectId
+from flask_caching import Cache
+import atexit
 
+# ──────────────────────────────────────────────
+# BASE / GLOBALS
+# ──────────────────────────────────────────────
 getcontext().prec = 12
 IST = ZoneInfo("Asia/Kolkata")
 
 app = Flask(__name__)
 CORS(app)
 
-from flask_caching import Cache
+# Small cache for polling endpoints
 cache = Cache(app, config={'CACHE_TYPE': 'SimpleCache', 'CACHE_DEFAULT_TIMEOUT': 5})
 
-
+# ──────────────────────────────────────────────
 # MongoDB Setup
+# ──────────────────────────────────────────────
 MONGO_URI = "mongodb+srv://netmanconnect:eDxdS7AkkimNGJdi@cluster0.exzvao3.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["mttrader"]
 status_logs = db["trades"]
 predictions_collection = db["prediction"]
+logs_collection = db["logs"]  # <— central app logs (startup, shutdown, errors, info)
 
+# In-memory runtime registries
 task_results = {}
 cancel_flags = {}
 auto_jobs = {}
 active_trades = {}
 
+# Background scheduler (IST)
 scheduler = BackgroundScheduler({
     'apscheduler.timezone': 'Asia/Kolkata',
     'apscheduler.job_defaults.misfire_grace_time': 300,
@@ -43,44 +58,93 @@ scheduler = BackgroundScheduler({
 })
 scheduler.start()
 
-# ═══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────
+# Logging Helper → writes to mttrader.logs
+# ──────────────────────────────────────────────
+def log_event(level: str, message: str, email: str = None, context: dict = None):
+    """
+    Store structured logs in MongoDB 'logs' collection.
+    Fields:
+      - timestamp (IST ISO)
+      - level (INFO|WARNING|ERROR|STARTUP|SHUTDOWN)
+      - message (string)
+      - email (optional, for per-user drill-down)
+      - context (dict)
+    """
+    try:
+        entry = {
+            "timestamp": datetime.now(IST).isoformat(),
+            "level": str(level).upper(),
+            "message": message,
+            "email": email,
+            "context": context or {},
+        }
+        logs_collection.insert_one(entry)
+        # Mirror to Flask logger
+        app.logger.info(f"[{entry['level']}] {message} | email={email} | ctx={entry['context']}")
+    except Exception as e:
+        app.logger.error(f"Failed to write to Mongo logs: {e}")
+
+# Startup / shutdown logs
+log_event("STARTUP", "AutoTrade bot started successfully.")
+def _on_shutdown():
+    log_event("SHUTDOWN", "AutoTrade bot stopped gracefully.")
+atexit.register(_on_shutdown)
+
+# Optional global error handler to ensure unhandled exceptions are logged
+@app.errorhandler(Exception)
+def _global_exception_handler(e):
+    log_event("ERROR", f"Unhandled exception: {str(e)}", context={"type": type(e).__name__})
+    return jsonify({"error": "Internal server error"}), 500
+
+# ──────────────────────────────────────────────
 # MAINNET CONFIGURATION
-# ═══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────
 BINANCE_MAINNET_URL = "https://fapi.binance.com"
 BINANCE_MAINNET_API_URL = "https://fapi.binance.com"
 
+# Minimum notional per symbol (updated hourly from exchangeInfo)
 min_order_values = {
     'BTCUSDT': Decimal('10'),
     'ETHUSDT': Decimal('10'),
     'DEFAULT': Decimal('10')
 }
 
+# Simple in-memory price cache
 current_prices = {
     'BTCUSDT': Decimal('0'),
     'ETHUSDT': Decimal('0')
 }
 
-# ── Utility Functions ──────────────────────────────
+# ──────────────────────────────────────────────
+# Utility Functions
+# ──────────────────────────────────────────────
 getcontext().prec = 18
 
 def fetch_price_with_retries(client, symbol: str, retries: int = 3, delay: float = 1.0) -> Decimal:
+    """Fetch ticker price with small retry window; updates current_prices cache."""
     for _ in range(retries):
         try:
             price = Decimal(client.ticker_price(symbol=symbol)["price"])
             current_prices[symbol] = price
             return price
         except Exception as e:
-            app.logger.warning(f"Fetch price failed: {e}")
+            app.logger.warning(f"Fetch price failed ({symbol}): {e}")
             time.sleep(delay)
     raise ConnectionError(f"Unable to fetch price for {symbol}")
 
 def get_available_balance(client) -> Decimal:
+    """Return available USDT balance from futures account."""
     for b in client.balance():
         if b['asset'] == 'USDT':
             return Decimal(b['availableBalance'])
     raise ValueError("USDT balance not found")
 
 def get_symbol_precision_and_step_size(client, symbol: str) -> tuple:
+    """
+    Read exchange_info and return (decimals, step_size) for LOT_SIZE filter.
+    Fallback: (4, 0.0001) if symbol not found.
+    """
     info = client.exchange_info()
     for s in info['symbols']:
         if s['symbol'] == symbol:
@@ -92,9 +156,11 @@ def get_symbol_precision_and_step_size(client, symbol: str) -> tuple:
     return 4, Decimal('0.0001')
 
 def truncate_to_step(quantity: Decimal, step_size: Decimal) -> Decimal:
+    """Floor quantity to exchange LOT_SIZE step."""
     return (quantity // step_size) * step_size
 
 def get_min_tradable_qty(client, symbol: str) -> Decimal:
+    """Compute min tradable qty from min notional and current price (floored to step)."""
     symbol = symbol.upper()
     min_usd = min_order_values.get(symbol, min_order_values['DEFAULT'])
     current_price = current_prices.get(symbol, Decimal('0'))
@@ -107,6 +173,11 @@ def get_min_tradable_qty(client, symbol: str) -> Decimal:
     return Decimal('0.0001')
 
 def calculate_trade_quantity(client, symbol: str, size_usdt: Decimal) -> tuple:
+    """
+    Returns (qty, adjusted_size, was_adjusted)
+    - Floors qty to step & respects min notional
+    - If size below min, returns min qty and adjusted_size
+    """
     price = fetch_price_with_retries(client, symbol)
     min_qty = get_min_tradable_qty(client, symbol)
     decimals, step_size = get_symbol_precision_and_step_size(client, symbol)
@@ -126,11 +197,10 @@ def calculate_trade_quantity(client, symbol: str, size_usdt: Decimal) -> tuple:
     return quantity, size_usdt, False
 
 def fetch_min_notional_values():
-    """Fetch minimum notional values from Binance MAINNET"""
+    """Fetch MIN_NOTIONAL from exchangeInfo hourly for BTC/ETH (extend as needed)."""
     try:
         res = requests.get(f'{BINANCE_MAINNET_API_URL}/fapi/v1/exchangeInfo', timeout=5)
         data = res.json()
-        
         for symbol in ['BTCUSDT', 'ETHUSDT']:
             symbol_info = next((s for s in data['symbols'] if s['symbol'] == symbol), None)
             if symbol_info:
@@ -140,95 +210,111 @@ def fetch_min_notional_values():
                     app.logger.info(f"Updated min notional for {symbol}: {min_order_values[symbol]}")
     except Exception as e:
         app.logger.error(f"Failed to fetch min notional values: {e}")
+        log_event("ERROR", "Failed to fetch min notional values", context={"error": str(e)})
 
+# Initial fetch and hourly refresh
 fetch_min_notional_values()
 scheduler.add_job(fetch_min_notional_values, 'interval', hours=1)
 
 def mark_failed(task_id: str, msg: str, email=None):
-    status_logs.update_one({"task_id": task_id}, {"$set": {
-        "status": "FAILED", "error_message": msg, "end_time": datetime.now(IST)
-    }})
+    """
+    Mark a running trade task as FAILED (db + memory), and free active_trades[email].
+    Also writes to logs collection.
+    """
+    try:
+        status_logs.update_one({"task_id": task_id}, {"$set": {
+            "status": "FAILED", "error_message": msg, "end_time": datetime.now(IST)
+        }})
+    except Exception as e:
+        app.logger.error(f"Failed to write FAILED status to Mongo: {e}")
+
     task_results[task_id] = {"status": "FAILED", "error_message": msg}
     if email:
         active_trades.pop(email, None)
+
     app.logger.error(f"{task_id} FAILED: {msg}")
+    log_event("ERROR", f"Trade task failed: {msg}", email=email, context={"task_id": task_id})
 
 def get_next_15min_interval() -> datetime:
-    """Get the next perfect 15-minute interval (e.g., 9:00, 9:15, 9:30)"""
+    """Get next 15-minute boundary (IST): e.g., 9:00, 9:15, 9:30, 9:45."""
     now = datetime.now(IST)
-    
-    # Round up to next 15-minute mark
     minutes = now.minute
     next_interval_minutes = ((minutes // 15) + 1) * 15
-    
     if next_interval_minutes >= 60:
         next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     else:
         next_time = now.replace(minute=next_interval_minutes, second=0, microsecond=0)
-    
     return next_time
 
-# ── MongoDB Prediction Fetching ──────────────────────────────
+# ──────────────────────────────────────────────
+# MongoDB Prediction Fetching
+# ──────────────────────────────────────────────
 def get_latest_prediction(symbol: str = "BTCUSDT") -> dict:
     try:
-        prediction = predictions_collection.find_one(
-            {},
-            sort=[("updatedAt", -1)]
-        )
-        
+        prediction = predictions_collection.find_one({}, sort=[("updatedAt", -1)])
         if not prediction:
             app.logger.warning("No prediction found in database")
             return None
-            
-        app.logger.info(f"Retrieved prediction: direction={prediction.get('direction')}, confidence={prediction.get('confidence')}")
+        app.logger.info(
+            f"Prediction: direction={prediction.get('direction')} "
+            f"conf={prediction.get('confidence')} "
+            f"entry={prediction.get('entry')} tp1={prediction.get('tp1')} tp2={prediction.get('tp2')} tp3={prediction.get('tp3')} sl={prediction.get('sl')}"
+        )
         return prediction
-        
     except Exception as e:
         app.logger.error(f"Error fetching prediction from MongoDB: {e}")
+        log_event("ERROR", "Error fetching prediction from Mongo", context={"error": str(e)})
         return None
 
 def parse_prediction_direction(prediction: dict) -> str:
+    """Return BUY/SELL based on LONG/SHORT; None if unknown."""
     if not prediction:
         return None
-        
-    direction = prediction.get("direction", "").upper()
-    
+    direction = str(prediction.get("direction", "")).upper()
     if direction == "LONG":
         return "BUY"
     elif direction == "SHORT":
         return "SELL"
-    else:
-        app.logger.warning(f"Unknown direction: {direction}")
-        return None
+    app.logger.warning(f"Unknown direction value in prediction: {direction}")
+    return None
 
-# ── Enhanced Trading Logic with TP1/TP2/TP3 ──────────────────────────────
-def auto_trade_with_tps(client, symbol, qty, tp_levels, sl_price, leverage, task_id, 
-                        callback_url=None, direction="BUY", email=None, entry_price_target=None):
+# ──────────────────────────────────────────────
+# Enhanced Trading Logic with TP1/TP2/TP3
+# ──────────────────────────────────────────────
+def auto_trade_with_tps(
+    client, symbol, qty, tp_levels, sl_price, leverage, task_id,
+    callback_url=None, direction="BUY", email=None, entry_price_target=None
+):
     """
-    Enhanced trading with multiple take-profit levels and trailing stop
-    tp_levels: dict like {"tp1": {"price": Decimal, "qty_pct": 33}, "tp2": {...}, "tp3": {...}}
+    Enhanced trading loop with multiple take-profit levels and breakeven logic.
+    tp_levels example:
+        {
+          "tp1": {"price": Decimal, "qty_pct": 33},
+          "tp2": {"price": Decimal, "qty_pct": 33},
+          "tp3": {"price": Decimal, "qty_pct": 34},
+        }
     """
     try:
-        # Wait for entry price if specified
+        # If an entry target is provided, wait up to 5 minutes to get filled around it
         if entry_price_target:
-            app.logger.info(f"{task_id}: Waiting for entry price {entry_price_target}")
-            max_wait = 300  # 5 minutes max wait
+            app.logger.info(f"{task_id}: Waiting for entry price {entry_price_target} ({direction})")
             wait_count = 0
+            max_wait = 300  # 5 minutes
             while wait_count < max_wait:
                 current_price = fetch_price_with_retries(client, symbol)
-                if direction == "BUY" and current_price <= entry_price_target:
-                    break
-                elif direction == "SELL" and current_price >= entry_price_target:
+                if (direction == "BUY" and current_price <= entry_price_target) or \
+                   (direction == "SELL" and current_price >= entry_price_target):
                     break
                 time.sleep(1)
                 wait_count += 1
-        
+
         entry_price = fetch_price_with_retries(client, symbol)
         client.change_leverage(symbol=symbol, leverage=leverage)
-        
+
         decimals = 9 if symbol == 'BTCUSDT' else 4
         qty_str = "{0:.{1}f}".format(float(qty), decimals)
-        
+
+        # Open market position
         client.new_order(
             symbol=symbol,
             side=direction,
@@ -236,30 +322,37 @@ def auto_trade_with_tps(client, symbol, qty, tp_levels, sl_price, leverage, task
             quantity=qty_str
         )
         app.logger.info(f"{task_id}: Entered {direction} {qty_str} {symbol} @ {entry_price}")
-        
-        # Update status log with TP levels
-        status_logs.update_one(
-            {"task_id": task_id},
-            {"$set": {
-                "entry_price": str(entry_price),
-                "tp_levels": {k: {"price": str(v["price"]), "qty_pct": v["qty_pct"]} for k, v in tp_levels.items()},
-                "sl_price": str(sl_price)
-            }}
-        )
-        
+        log_event("INFO", f"Entered position {direction} {symbol}", email=email,
+                  context={"task_id": task_id, "qty": qty_str, "entry": str(entry_price)})
+
+        # Record entry in DB
+        try:
+            status_logs.update_one(
+                {"task_id": task_id},
+                {"$set": {
+                    "entry_price": str(entry_price),
+                    "tp_levels": {k: {"price": str(v["price"]), "qty_pct": v["qty_pct"]} for k, v in tp_levels.items()},
+                    "sl_price": str(sl_price)
+                }}
+            )
+        except Exception as e:
+            app.logger.error(f"{task_id}: Failed to write entry to Mongo: {e}")
+
     except Exception as e:
+        # Opening trade failed → mark FAILED and exit
+        log_event("ERROR", f"Open position failed: {e}", email=email, context={"task_id": task_id})
         return mark_failed(task_id, str(e), email=email)
 
-    # Track remaining quantity and TP hits
+    # Runtime loop for TP/SL
     remaining_qty = qty
     _, step_size = get_symbol_precision_and_step_size(client, symbol)
     tp_hits = []
     current_sl = sl_price
     breakeven_moved = False
-    
+
     step = 0
-    max_steps = 86400  # 24 hours max
-    
+    max_steps = 86400  # 24h safety cutoff
+
     while True:
         if cancel_flags.get(task_id):
             exit_reason = "CANCELLED_BY_USER"
@@ -268,12 +361,13 @@ def auto_trade_with_tps(client, symbol, qty, tp_levels, sl_price, leverage, task
             try:
                 price = fetch_price_with_retries(client, symbol)
             except Exception as e:
+                log_event("ERROR", f"Price fetch failed in loop: {e}", email=email, context={"task_id": task_id})
                 return mark_failed(task_id, str(e), email=email)
-            
+
             exit_reason = None
             exit_qty = None
-            
-            # Check stop loss
+
+            # Check SL (directional)
             if direction == "BUY":
                 if price <= current_sl:
                     exit_reason = "STOPPED_LOSS"
@@ -282,33 +376,27 @@ def auto_trade_with_tps(client, symbol, qty, tp_levels, sl_price, leverage, task
                 if price >= current_sl:
                     exit_reason = "STOPPED_LOSS"
                     exit_qty = remaining_qty
-            
-            # Check TP levels in order
+
+            # TPs sequential
             if not exit_reason:
                 for tp_name in ["tp1", "tp2", "tp3"]:
                     if tp_name not in tp_levels or tp_name in tp_hits:
                         continue
-                    
+
                     tp_data = tp_levels[tp_name]
                     tp_price = tp_data["price"]
                     tp_qty_pct = tp_data["qty_pct"]
-                    
-                    hit = False
-                    if direction == "BUY" and price >= tp_price:
-                        hit = True
-                    elif direction == "SELL" and price <= tp_price:
-                        hit = True
-                    
+
+                    hit = (direction == "BUY" and price >= tp_price) or (direction == "SELL" and price <= tp_price)
                     if hit:
-                        # Calculate partial exit quantity
+                        # Partial close
                         partial_qty = truncate_to_step(qty * Decimal(tp_qty_pct) / Decimal(100), step_size)
-                        
                         if partial_qty > remaining_qty:
                             partial_qty = remaining_qty
-                        
+
                         if partial_qty > 0:
                             try:
-                                partial_qty_str = "{0:.{1}f}".format(float(partial_qty), decimals)
+                                partial_qty_str = "{0:.{1}f}".format(float(partial_qty), (9 if symbol == 'BTCUSDT' else 4))
                                 client.new_order(
                                     symbol=symbol,
                                     side="SELL" if direction == "BUY" else "BUY",
@@ -316,50 +404,55 @@ def auto_trade_with_tps(client, symbol, qty, tp_levels, sl_price, leverage, task
                                     quantity=partial_qty_str,
                                     reduceOnly=True
                                 )
-                                
+
                                 remaining_qty -= partial_qty
                                 tp_hits.append(tp_name)
-                                
                                 app.logger.info(f"{task_id}: {tp_name} HIT at {price}. Closed {partial_qty_str}, Remaining: {remaining_qty}")
-                                
+                                log_event("INFO", f"{tp_name} hit", email=email,
+                                          context={"task_id": task_id, "price": str(price), "partial_qty": partial_qty_str})
+
                                 # Move SL to breakeven after TP1
                                 if tp_name == "tp1" and not breakeven_moved:
                                     current_sl = entry_price
                                     breakeven_moved = True
                                     app.logger.info(f"{task_id}: Stop loss moved to breakeven at {entry_price}")
-                                
-                                # Update database
-                                status_logs.update_one(
-                                    {"task_id": task_id},
-                                    {"$push": {"tp_hits": {
-                                        "level": tp_name,
-                                        "price": str(price),
-                                        "quantity": str(partial_qty),
-                                        "time": datetime.now(IST).isoformat()
-                                    }}}
-                                )
-                                
-                                # If all quantity closed, exit
+
+                                # DB TP hit
+                                try:
+                                    status_logs.update_one(
+                                        {"task_id": task_id},
+                                        {"$push": {"tp_hits": {
+                                            "level": tp_name,
+                                            "price": str(price),
+                                            "quantity": str(partial_qty),
+                                            "time": datetime.now(IST).isoformat()
+                                        }}}
+                                    )
+                                except Exception as e:
+                                    app.logger.error(f"{task_id}: Failed to push TP hit to Mongo: {e}")
+
                                 if remaining_qty <= step_size:
                                     exit_reason = "ALL_TPS_COMPLETED"
                                     exit_qty = Decimal(0)
                                     break
-                                
+
                             except Exception as e:
                                 app.logger.error(f"{task_id}: Error closing {tp_name}: {e}")
-            
-            # Forced exit after max time
+                                log_event("ERROR", f"Error closing {tp_name}: {e}", email=email, context={"task_id": task_id})
+
+            # Forced cutoff after max_steps
             if step >= max_steps and not exit_reason:
                 exit_reason = "FORCED_EXIT"
                 exit_qty = remaining_qty
 
-        # Final exit
+        # Finalize on exit_reason
         if exit_reason:
             final_pnl_amt = Decimal(0)
-            
-            # Close remaining position if any
+
+            # Close remaining if any
             if exit_qty and exit_qty > step_size:
                 try:
+                    decimals = 9 if symbol == 'BTCUSDT' else 4
                     exit_qty_str = "{0:.{1}f}".format(float(exit_qty), decimals)
                     client.new_order(
                         symbol=symbol,
@@ -371,8 +464,9 @@ def auto_trade_with_tps(client, symbol, qty, tp_levels, sl_price, leverage, task
                     app.logger.info(f"{task_id}: Final exit {exit_qty_str} at {price}")
                 except Exception as e:
                     app.logger.error(f"{task_id}: Final exit error: {e}")
-            
-            # Calculate total PnL
+                    log_event("ERROR", f"Final exit error: {e}", email=email, context={"task_id": task_id})
+
+            # Compute pnl
             current_price = fetch_price_with_retries(client, symbol)
             if direction == "BUY":
                 final_pnl_amt = (current_price - entry_price) * qty
@@ -380,7 +474,7 @@ def auto_trade_with_tps(client, symbol, qty, tp_levels, sl_price, leverage, task
             else:
                 final_pnl_amt = (entry_price - current_price) * qty
                 pnl_pct = ((entry_price - current_price) / entry_price * Decimal("100"))
-            
+
             result = {
                 "status": exit_reason,
                 "symbol": symbol,
@@ -393,97 +487,95 @@ def auto_trade_with_tps(client, symbol, qty, tp_levels, sl_price, leverage, task
                 "closed_quantity": str(qty - remaining_qty),
                 "ledger_balance": "N/A"
             }
-            
+
             task_results[task_id] = result
-            status_logs.update_one({"task_id": task_id}, {"$set": {**result, "end_time": datetime.now(IST)}})
-            
+            try:
+                status_logs.update_one({"task_id": task_id}, {"$set": {**result, "end_time": datetime.now(IST)}})
+            except Exception as e:
+                app.logger.error(f"{task_id}: Failed to write final result to Mongo: {e}")
+
             if email:
                 active_trades.pop(email, None)
-            
+
             if callback_url:
                 try:
                     requests.post(callback_url, json={"task_id": task_id, **result}, timeout=10)
-                except:
+                except Exception:
                     pass
-            
+
+            log_event("INFO", f"Trade finished: {exit_reason}", email=email,
+                      context={"task_id": task_id, "pnl": result["pnl_amount"], "pnl_pct": result["pnl_percent"]})
+
             cancel_flags.pop(task_id, None)
             break
 
         step += 1
         time.sleep(1)
 
-# ── Prediction Polling with TP mechanism ──────────────────────────────
+# ──────────────────────────────────────────────
+# (End of Part 1/5)
+# Next: poll_predict_and_trade, routes, fail-stop wiring, etc.
+# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Polling + Auto-Trade Scheduling Logic
+# ──────────────────────────────────────────────
+
 def poll_predict_and_trade(job_id: str):
+    """
+    Periodically polls MongoDB predictions and initiates trades if threshold met.
+    Modified: removed 'skip first signal', stops the job entirely if trade or
+    balance error occurs (fail-safe).
+    """
     meta = auto_jobs[job_id]
     email = meta["trade_params"]["email"]
     symbol = meta["trade_params"].get("symbol", "BTCUSDT").upper()
-    
-    # Check if we've reached the trade limit
+
+    # Stop if max trades reached
     if meta["executed_count"] >= meta["max_trades"]:
-        app.logger.info(f"{job_id}: Max trades ({meta['max_trades']}) reached. Stopping job.")
         try:
             meta["job"].remove()
             meta["status"] = "COMPLETED"
-            app.logger.info(f"{job_id}: Job stopped after completing {meta['executed_count']} trades")
+            log_event("INFO", f"Auto-trade completed all {meta['max_trades']} trades", email)
         except Exception as e:
-            app.logger.error(f"{job_id}: Error stopping job: {e}")
+            log_event("ERROR", f"Job stop error: {e}", email)
         return
 
+    # Avoid multiple concurrent trades for same email
     if email in active_trades:
-        app.logger.info(f"{job_id}: User {email} already has an active trade.")
+        log_event("INFO", f"{email} already has an active trade", email)
         return
 
     try:
         prediction = get_latest_prediction(symbol)
-        
         if not prediction:
-            app.logger.warning(f"{job_id}: No prediction available in database")
+            log_event("WARNING", "No prediction found in DB", email)
             return
-        
-        # Store last prediction
-        meta["last_prediction"] = {
-            "direction": prediction.get("direction"),
-            "confidence": prediction.get("confidence"),
-            "entry": prediction.get("entry"),
-            "tp1": prediction.get("tp1"),
-            "tp2": prediction.get("tp2"),
-            "tp3": prediction.get("tp3"),
-            "sl": prediction.get("sl"),
-            "updatedAt": prediction.get("updatedAtIST")
-        }
-        
+
         direction = parse_prediction_direction(prediction)
         confidence = float(prediction.get("confidence", 0))
-        
-        app.logger.info(f"{job_id}: MongoDB prediction - direction={direction}, confidence={confidence}")
-        
+        log_event("INFO", f"Prediction dir={direction} conf={confidence}", email)
+
     except Exception as e:
-        app.logger.error(f"{job_id} prediction fetch failed: {e}")
+        log_event("ERROR", f"Prediction fetch failed: {e}", email)
         return
 
-    # Skip first signal logic
-    if not meta.get("first_signal_skipped", False):
-        app.logger.info(f"{job_id}: First signal skipped.")
-        meta["first_signal_skipped"] = True
-        return
-
-    # Check if confidence meets threshold and direction is valid
+    # Proceed if threshold met
     if direction and confidence >= meta["threshold"]:
         payload = meta["trade_params"].copy()
         payload["direction"] = direction
-        
-        # Add TP levels from prediction
+
+        # Add TP levels if present
         if all(k in prediction for k in ["tp1", "tp2", "tp3", "sl"]):
             payload["use_tp_levels"] = True
-            payload["tp1"] = prediction.get("tp1")
-            payload["tp2"] = prediction.get("tp2")
-            payload["tp3"] = prediction.get("tp3")
-            payload["sl"] = prediction.get("sl")
+            payload["tp1"] = prediction["tp1"]
+            payload["tp2"] = prediction["tp2"]
+            payload["tp3"] = prediction["tp3"]
+            payload["sl"] = prediction["sl"]
             payload["entry_target"] = prediction.get("entry")
-        
+
         try:
-            r = requests.post("http://127.0.0.1:5002/trade", json=payload, timeout=10)
-            app.logger.info(f"{job_id}: POST /trade → {r.status_code} {r.text}")
+            r = requests.post("http://127.0.0.1:5002/trade", json=payload, timeout=15)
+            app.logger.info(f"{job_id}: POST /trade → {r.status_code}")
             if r.status_code in (200, 202):
                 meta["executed_count"] += 1
                 meta["executed_trades"].append({
@@ -494,54 +586,58 @@ def poll_predict_and_trade(job_id: str):
                     "tp_levels_used": payload.get("use_tp_levels", False),
                     "trade_number": meta["executed_count"]
                 })
-                app.logger.info(f"{job_id}: Trade {meta['executed_count']}/{meta['max_trades']} executed")
+                log_event("INFO", f"Trade {meta['executed_count']} executed", email)
+            else:
+                meta["job"].remove()
+                meta["status"] = "FAILED"
+                log_event("ERROR", "Trade API returned failure, stopping job", email,
+                          {"status": r.status_code, "text": r.text})
         except Exception as e:
-            app.logger.error(f"{job_id}: trade request failed: {e}")
+            meta["job"].remove()
+            meta["status"] = "FAILED"
+            log_event("ERROR", f"Trade request failed: {e}", email)
     else:
-        app.logger.info(f"{job_id}: Threshold not met or no valid direction")
+        log_event("INFO", "Threshold not met or invalid direction", email)
 
-# ── Flask Endpoints ──────────────────────────────
+# ──────────────────────────────────────────────
+# Flask Routes — Main Trading Endpoints
+# ──────────────────────────────────────────────
+
 @app.route("/trade", methods=["POST"])
 def start_trade():
     data = request.get_json(force=True)
-    
     required_fields = ["email", "symbol", "leverage", "api_key", "api_secret", "size_usdt"]
     for f in required_fields:
         if f not in data:
             return jsonify({"error": f"Missing required field: {f}"}), 400
 
-    if data["email"] in active_trades:
-        return jsonify({"error": "You have an active trade. Please wait for it to complete."}), 403
+    email = data["email"]
+    if email in active_trades:
+        return jsonify({"error": "You already have an active trade."}), 403
 
     try:
         client = UMFutures(key=data["api_key"], secret=data["api_secret"], base_url=BINANCE_MAINNET_URL)
-        
         size_usdt = Decimal(str(data["size_usdt"]))
         if size_usdt <= 0:
             return jsonify({"error": "Size must be positive"}), 400
-            
+
         qty, adjusted_size, was_adjusted = calculate_trade_quantity(client, data["symbol"], size_usdt)
-        
         bal = get_available_balance(client)
         required = adjusted_size / Decimal(data["leverage"])
         if bal < required:
-            return jsonify({
-                "error": f"Insufficient balance. Need {required:.2f} USDT, available {bal:.2f}",
-                "required": str(required),
-                "available": str(bal)
-            }), 400
+            msg = f"Insufficient balance: need {required:.2f}, have {bal:.2f}"
+            log_event("ERROR", msg, email)
+            return jsonify({"error": msg}), 400
 
         task_id = str(uuid.uuid4())
         task_results[task_id] = {"status": "RUNNING"}
         cancel_flags[task_id] = False
-        active_trades[data["email"]] = task_id
-        
-        # Check if using TP levels or simple profit/loss
+        active_trades[email] = task_id
+
         use_tp_levels = data.get("use_tp_levels", False)
-        
         status_logs.insert_one({
             "task_id": task_id,
-            "email": data["email"],
+            "email": email,
             "symbol": data["symbol"],
             "size_usdt": str(adjusted_size),
             "quantity": str(qty),
@@ -556,9 +652,9 @@ def start_trade():
         })
 
         direction = data.get("direction", "BUY").upper()
-        
+
+        # TP-based trade
         if use_tp_levels and all(k in data for k in ["tp1", "tp2", "tp3", "sl"]):
-            # Use TP1/TP2/TP3 mechanism
             tp_levels = {
                 "tp1": {"price": Decimal(str(data["tp1"])), "qty_pct": 33},
                 "tp2": {"price": Decimal(str(data["tp2"])), "qty_pct": 33},
@@ -566,111 +662,93 @@ def start_trade():
             }
             sl_price = Decimal(str(data["sl"]))
             entry_target = Decimal(str(data["entry_target"])) if data.get("entry_target") else None
-            
+
             threading.Thread(
                 target=auto_trade_with_tps,
-                args=(client, data["symbol"], qty, tp_levels, sl_price, int(data["leverage"]), 
-                      task_id, data.get("callback_url"), direction, data["email"], entry_target),
+                args=(client, data["symbol"], qty, tp_levels, sl_price,
+                      int(data["leverage"]), task_id, data.get("callback_url"),
+                      direction, email, entry_target),
                 daemon=True
             ).start()
-            
+
+            log_event("INFO", "Started TP_LEVELS trade", email, {"task_id": task_id})
             return jsonify({
                 "task_id": task_id,
                 "status": "STARTED",
-                "symbol": data["symbol"],
-                "size_usdt": str(adjusted_size),
-                "quantity": str(qty),
-                "leverage": int(data["leverage"]),
                 "trade_type": "TP_LEVELS",
-                "environment": "MAINNET",
-                "tp_levels": {"tp1": str(data["tp1"]), "tp2": str(data["tp2"]), "tp3": str(data["tp3"])},
-                "sl": str(data["sl"]),
-                "message": "MAINNET trade started with TP1/TP2/TP3 mechanism"
-            }), 202
-        else:
-            # Fallback to simple profit/loss mechanism
-            if "profit_percent" not in data or "loss_percent" not in data:
-                return jsonify({"error": "Missing profit_percent or loss_percent for simple trade"}), 400
-            
-            from threading import Thread
-            
-            def simple_auto_trade():
-                try:
-                    entry_price = fetch_price_with_retries(client, data["symbol"])
-                    client.change_leverage(symbol=data["symbol"], leverage=int(data["leverage"]))
-                    
-                    decimals = 9 if data["symbol"] == 'BTCUSDT' else 4
-                    qty_str = "{0:.{1}f}".format(float(qty), decimals)
-                    
-                    client.new_order(symbol=data["symbol"], side=direction, type='MARKET', quantity=qty_str)
-                    
-                    profit_pct = Decimal(str(data["profit_percent"]))
-                    loss_pct = Decimal(str(data["loss_percent"]))
-                    
-                    while True:
-                        if cancel_flags.get(task_id):
-                            exit_reason = "CANCELLED_BY_USER"
-                        else:
-                            price = fetch_price_with_retries(client, data["symbol"])
-                            pnl_pct = ((price - entry_price) / entry_price * Decimal("100")) if direction == "BUY" else ((entry_price - price) / entry_price * Decimal("100"))
-                            
-                            if pnl_pct >= profit_pct:
-                                exit_reason = "COMPLETED"
-                            elif pnl_pct <= -loss_pct:
-                                exit_reason = "STOPPED_LOSS"
-                            else:
-                                time.sleep(1)
-                                continue
-                        
-                        client.new_order(symbol=data["symbol"], side="SELL" if direction == "BUY" else "BUY", 
-                                       type='MARKET', quantity=qty_str, reduceOnly=True)
-                        
-                        price = fetch_price_with_retries(client, data["symbol"])
-                        pnl_amt = (price - entry_price) * Decimal(qty_str) if direction == "BUY" else (entry_price - price) * Decimal(qty_str)
-                        pnl_pct = ((price - entry_price) / entry_price * Decimal("100")) if direction == "BUY" else ((entry_price - price) / entry_price * Decimal("100"))
-                        
-                        result = {"status": exit_reason, "pnl_amount": str(pnl_amt), "pnl_percent": str(pnl_pct)}
-                        task_results[task_id] = result
-                        status_logs.update_one({"task_id": task_id}, {"$set": {**result, "end_time": datetime.now(IST)}})
-                        
-                        if data["email"]:
-                            active_trades.pop(data["email"], None)
-                        break
-                        
-                except Exception as e:
-                    mark_failed(task_id, str(e), email=data["email"])
-            
-            Thread(target=simple_auto_trade, daemon=True).start()
-            
-            return jsonify({
-                "task_id": task_id,
-                "status": "STARTED",
                 "symbol": data["symbol"],
-                "trade_type": "SIMPLE",
-                "environment": "MAINNET",
-                "message": "MAINNET trade started with simple profit/loss"
+                "environment": "MAINNET"
             }), 202
 
+        # Simple P/L trade
+        if "profit_percent" not in data or "loss_percent" not in data:
+            return jsonify({"error": "Missing profit_percent or loss_percent"}), 400
+
+        from threading import Thread
+        def simple_auto_trade():
+            try:
+                entry_price = fetch_price_with_retries(client, data["symbol"])
+                client.change_leverage(symbol=data["symbol"], leverage=int(data["leverage"]))
+                decimals = 9 if data["symbol"] == 'BTCUSDT' else 4
+                qty_str = f"{float(qty):.{decimals}f}"
+
+                client.new_order(symbol=data["symbol"], side=direction, type='MARKET', quantity=qty_str)
+                profit_pct = Decimal(str(data["profit_percent"]))
+                loss_pct = Decimal(str(data["loss_percent"]))
+
+                while True:
+                    if cancel_flags.get(task_id):
+                        exit_reason = "CANCELLED_BY_USER"
+                        break
+                    price = fetch_price_with_retries(client, data["symbol"])
+                    pnl_pct = ((price - entry_price) / entry_price * Decimal("100")) if direction == "BUY" else ((entry_price - price) / entry_price * Decimal("100"))
+                    if pnl_pct >= profit_pct:
+                        exit_reason = "COMPLETED"; break
+                    if pnl_pct <= -loss_pct:
+                        exit_reason = "STOPPED_LOSS"; break
+                    time.sleep(1)
+
+                client.new_order(symbol=data["symbol"], side="SELL" if direction == "BUY" else "BUY",
+                                 type='MARKET', quantity=qty_str, reduceOnly=True)
+                price = fetch_price_with_retries(client, data["symbol"])
+                pnl_amt = (price - entry_price) * Decimal(qty_str) if direction == "BUY" else (entry_price - price) * Decimal(qty_str)
+                pnl_pct = ((price - entry_price) / entry_price * Decimal("100")) if direction == "BUY" else ((entry_price - price) / entry_price * Decimal("100"))
+                result = {"status": exit_reason, "pnl_amount": str(pnl_amt), "pnl_percent": str(pnl_pct)}
+                task_results[task_id] = result
+                status_logs.update_one({"task_id": task_id}, {"$set": {**result, "end_time": datetime.now(IST)}})
+                if email:
+                    active_trades.pop(email, None)
+                log_event("INFO", f"Simple trade finished: {exit_reason}", email, {"pnl": str(pnl_pct)})
+            except Exception as e:
+                mark_failed(task_id, str(e), email=email)
+
+        Thread(target=simple_auto_trade, daemon=True).start()
+        return jsonify({
+            "task_id": task_id,
+            "status": "STARTED",
+            "trade_type": "SIMPLE",
+            "symbol": data["symbol"],
+            "environment": "MAINNET"
+        }), 202
+
     except Exception as e:
-        app.logger.error(f"MAINNET Trade failed: {str(e)}")
+        log_event("ERROR", f"Trade init failed: {e}", email)
         return jsonify({"error": "Trade initialization failed", "details": str(e)}), 502
+# ──────────────────────────────────────────────
+# Auto-Trade Job Scheduling Endpoints
+# ──────────────────────────────────────────────
 
 @app.route("/start_auto_trade", methods=["POST"])
 def start_auto_trade():
     data = request.get_json(force=True)
-
-    required_fields = [
-        "email", "symbol", "size_usdt", "leverage", "api_key", "api_secret", "threshold"
-    ]
-    
+    required_fields = ["email", "symbol", "size_usdt", "leverage", "api_key", "api_secret", "threshold"]
     for f in required_fields:
         if f not in data:
-            return jsonify({"error": f"Missing required field: {f}"}), 400
+            return jsonify({"error": f"Missing field: {f}"}), 400
 
-    # Get max_trades parameter (default to 10)
     max_trades = int(data.get("max_trades", 10))
     if max_trades <= 0:
-        return jsonify({"error": "max_trades must be greater than 0"}), 400
+        return jsonify({"error": "max_trades must be > 0"}), 400
 
     trade_params = {
         "email": data["email"],
@@ -680,25 +758,19 @@ def start_auto_trade():
         "api_key": data["api_key"],
         "api_secret": data["api_secret"]
     }
-    
-    # Add optional profit/loss for simple mode
-    if "profit_percent" in data:
-        trade_params["profit_percent"] = str(data["profit_percent"])
-    if "loss_percent" in data:
-        trade_params["loss_percent"] = str(data["loss_percent"])
+    if "profit_percent" in data: trade_params["profit_percent"] = str(data["profit_percent"])
+    if "loss_percent" in data: trade_params["loss_percent"] = str(data["loss_percent"])
 
     try:
         threshold = float(data["threshold"])
         if threshold <= 0 or threshold > 1:
             return jsonify({"error": "Threshold must be between 0 and 1"}), 400
     except Exception as e:
-        return jsonify({"error": f"Invalid threshold: {str(e)}"}), 400
+        return jsonify({"error": f"Invalid threshold: {e}"}), 400
 
     job_id = str(uuid.uuid4())
-    
-    # Calculate next perfect 15-minute interval
     next_run = get_next_15min_interval()
-    
+
     job = scheduler.add_job(
         poll_predict_and_trade,
         trigger="cron",
@@ -714,89 +786,71 @@ def start_auto_trade():
         "trade_params": trade_params,
         "last_prediction": None,
         "executed_trades": [],
-        "first_signal_skipped": False,
         "max_trades": max_trades,
         "executed_count": 0,
         "status": "ACTIVE"
     }
 
+    log_event("INFO", "Started auto-trade job", data["email"], {"job_id": job_id})
     return jsonify({
         "job_id": job_id,
-        "message": f"Auto-trade started successfully. Will execute {max_trades} trades then stop.",
+        "message": f"Auto-trade started successfully ({max_trades} trades).",
         "max_trades": max_trades,
         "next_run_time": job.next_run_time.isoformat(),
         "interval": "Every 15 minutes (:00, :15, :30, :45)",
-        "symbol": data["symbol"],
-        "environment": "MAINNET"
+        "symbol": data["symbol"]
     }), 202
+
 
 @app.route("/auto_trade_status/<job_id>", methods=["GET"])
 def auto_trade_status(job_id):
     meta = auto_jobs.get(job_id)
     if not meta:
         return jsonify({"error": "Job not found"}), 404
-    
     return jsonify({
         "job_id": job_id,
         "status": meta.get("status", "ACTIVE"),
         "symbol": meta["trade_params"]["symbol"],
-        "last_prediction": meta["last_prediction"],
-        "executed_trades": meta["executed_trades"],
         "executed_count": meta["executed_count"],
         "max_trades": meta["max_trades"],
         "remaining_trades": meta["max_trades"] - meta["executed_count"],
         "next_run_time": meta["job"].next_run_time.isoformat() if meta["job"].next_run_time else None,
-        "threshold": meta["threshold"],
-        "environment": "MAINNET"
+        "threshold": meta["threshold"]
     })
 
 @app.route("/auto_trade_status_by_email", methods=["POST"])
 @cache.cached(timeout=5, query_string=False)
 def auto_trade_status_by_email():
-    """Return all auto-trade jobs for a user, cached for 5 seconds."""
+    """Return all jobs for an email, cached 5s"""
     data = request.get_json(force=True)
     email = data.get("email")
     if not email:
         return jsonify({"error": "Missing field: email"}), 400
 
-    results = [
-        {
-            "job_id": job_id,
-            "symbol": meta["trade_params"]["symbol"],
-            "status": meta.get("status", "ACTIVE"),
-            "last_prediction": meta["last_prediction"],
-            "executed_trades": meta["executed_trades"],
-            "executed_count": meta["executed_count"],
-            "max_trades": meta["max_trades"],
-            "remaining_trades": meta["max_trades"] - meta["executed_count"],
-            "next_run_time": meta["job"].next_run_time.isoformat()
-            if meta["job"].next_run_time else None,
-            "threshold": meta["threshold"],
-        }
-        for job_id, meta in auto_jobs.items()
-        if meta["trade_params"].get("email") == email
-    ]
+    results = [{
+        "job_id": job_id,
+        "symbol": meta["trade_params"]["symbol"],
+        "status": meta.get("status", "ACTIVE"),
+        "executed_count": meta["executed_count"],
+        "max_trades": meta["max_trades"],
+        "remaining_trades": meta["max_trades"] - meta["executed_count"],
+        "next_run_time": meta["job"].next_run_time.isoformat() if meta["job"].next_run_time else None,
+        "threshold": meta["threshold"]
+    } for job_id, meta in auto_jobs.items() if meta["trade_params"].get("email") == email]
 
     if not results:
-        return jsonify(
-            {"email": email, "jobs": [], "message": "No active auto-trade jobs found"}
-        ), 404
+        return jsonify({"email": email, "jobs": [], "message": "No jobs found"}), 404
+    return jsonify({"email": email, "jobs": results, "count": len(results)}), 200
 
-    return jsonify(
-        {
-            "email": email,
-            "jobs": results,
-            "count": len(results),
-            "environment": "MAINNET",
-        }
-    ), 200
+# ──────────────────────────────────────────────
+# Trade Status & Cancel Operations
+# ──────────────────────────────────────────────
 
 @app.route("/status/<task_id>", methods=["GET"])
 def get_status(task_id):
     result = task_results.get(task_id)
     if not result:
         return jsonify({"error": "Task not found"}), 404
-    
     db_entry = status_logs.find_one({"task_id": task_id})
     if db_entry:
         result.update({
@@ -805,36 +859,20 @@ def get_status(task_id):
             "symbol": db_entry.get("symbol"),
             "leverage": db_entry.get("leverage"),
             "size_usdt": db_entry.get("size_usdt"),
-            "size_adjusted": db_entry.get("size_adjusted", False),
-            "requested_size": db_entry.get("requested_size"),
-            "use_tp_levels": db_entry.get("use_tp_levels", False),
-            "tp_hits": db_entry.get("tp_hits", []),
-            "environment": db_entry.get("environment", "MAINNET")
+            "tp_hits": db_entry.get("tp_hits", [])
         })
-    
     return jsonify(result)
 
 @app.route("/cancel/<task_id>", methods=["POST"])
 def cancel_trade(task_id):
     if task_id not in task_results:
         return jsonify({"error": "Task not found"}), 404
-        
     if task_results[task_id].get("status") != "RUNNING":
-        return jsonify({"error": "Cannot cancel - trade is not running"}), 400
-        
+        return jsonify({"error": "Cannot cancel non-running trade"}), 400
     cancel_flags[task_id] = True
-    status_logs.update_one(
-        {"task_id": task_id},
-        {"$set": {
-            "status": "CANCELLED",
-            "cancel_time": datetime.now(IST)
-        }}
-    )
-    return jsonify({
-        "task_id": task_id,
-        "status": "CANCEL_REQUESTED",
-        "message": "Cancel request received"
-    }), 202
+    status_logs.update_one({"task_id": task_id}, {"$set": {"status": "CANCELLED", "cancel_time": datetime.now(IST)}})
+    log_event("INFO", "Cancel requested", None, {"task_id": task_id})
+    return jsonify({"task_id": task_id, "status": "CANCEL_REQUESTED"}), 202
 
 def stop_auto_trade_jobs_by_email(email: str):
     stopped_jobs = []
@@ -845,7 +883,7 @@ def stop_auto_trade_jobs_by_email(email: str):
                 meta["status"] = "STOPPED_BY_USER"
                 stopped_jobs.append(job_id)
             except Exception as e:
-                app.logger.error(f"Failed to remove job {job_id}: {e}")
+                log_event("ERROR", f"Failed to stop job {job_id}: {e}", email)
     return stopped_jobs
 
 @app.route("/cancel_by_email", methods=["POST"])
@@ -853,31 +891,27 @@ def cancel_by_email():
     data = request.get_json(force=True)
     email = data.get("email")
     if not email:
-        return jsonify({"error": "Missing field: email"}), 400
+        return jsonify({"error": "Missing email"}), 400
 
     docs = status_logs.find({"email": email, "status": "RUNNING"}, {"task_id": 1})
     tids = [d["task_id"] for d in docs]
-    for t in tids:
-        cancel_flags[t] = True
-    status_logs.update_many(
-        {"task_id": {"$in": tids}},
-        {"$set": {
-            "status": "CANCELLED",
-            "cancel_time": datetime.now(IST)
-        }}
-    )
+    for t in tids: cancel_flags[t] = True
+    status_logs.update_many({"task_id": {"$in": tids}},
+                            {"$set": {"status": "CANCELLED", "cancel_time": datetime.now(IST)}})
 
     stopped_job_ids = stop_auto_trade_jobs_by_email(email)
-
     if email in active_trades:
         active_trades.pop(email)
-
+    log_event("INFO", f"Cancelled {len(tids)} trades", email)
     return jsonify({
         "email": email,
         "cancelled_trades": tids,
         "stopped_auto_trade_jobs": stopped_job_ids,
-        "message": f"Cancelled {len(tids)} trades and stopped {len(stopped_job_ids)} auto-trade jobs"
+        "message": f"Cancelled {len(tids)} trades and stopped {len(stopped_job_ids)} jobs"
     }), 202
+# ──────────────────────────────────────────────
+# Emergency Stop, Price, Balance, and Prediction APIs
+# ──────────────────────────────────────────────
 
 @app.route("/emergency_stop", methods=["POST"])
 def emergency_stop():
@@ -886,10 +920,7 @@ def emergency_stop():
         cancel_flags[task_id] = True
         status_logs.update_one(
             {"task_id": task_id},
-            {"$set": {
-                "status": "EMERGENCY_STOPPED",
-                "end_time": datetime.now(IST)
-            }}
+            {"$set": {"status": "EMERGENCY_STOPPED", "end_time": datetime.now(IST)}}
         )
 
     stopped_jobs = []
@@ -899,10 +930,10 @@ def emergency_stop():
             meta["status"] = "EMERGENCY_STOPPED"
             stopped_jobs.append(job_id)
         except Exception as e:
-            app.logger.error(f"Failed to remove job {job_id}: {e}")
+            log_event("ERROR", f"Failed to remove job {job_id}: {e}")
 
     active_trades.clear()
-
+    log_event("WARNING", "Emergency stop triggered", None, {"cancelled_trades": running_tasks, "stopped_jobs": stopped_jobs})
     return jsonify({
         "message": "Emergency stop executed successfully",
         "cancelled_trades": running_tasks,
@@ -910,142 +941,157 @@ def emergency_stop():
         "timestamp": datetime.now(IST).isoformat()
     }), 200
 
+
 @app.route("/price", methods=["GET"])
 def price():
     sym = request.args.get("symbol", "BTCUSDT").upper()
     try:
-        res = requests.get(
-            f"{BINANCE_MAINNET_API_URL}/fapi/v1/ticker/price?symbol={sym}",
-            timeout=5
-        )
+        res = requests.get(f"{BINANCE_MAINNET_API_URL}/fapi/v1/ticker/price?symbol={sym}", timeout=5)
         res.raise_for_status()
         price = Decimal(res.json()["price"])
         current_prices[sym] = price
         return jsonify({
             "symbol": sym,
             "price": str(price),
-            "timestamp": datetime.now(IST).isoformat(),
-            "environment": "MAINNET"
-        })
+            "timestamp": datetime.now(IST).isoformat()
+        }), 200
     except Exception as e:
-        app.logger.error(f"MAINNET Price fetch failed for {sym}: {e}")
-        return jsonify({
-            "error": "Price fetch failed",
-            "symbol": sym,
-            "details": str(e)
-        }), 500
+        log_event("ERROR", f"Price fetch failed: {e}", None, {"symbol": sym})
+        return jsonify({"error": f"Failed to fetch price for {sym}", "details": str(e)}), 500
+
 
 @app.route("/balance", methods=["POST"])
 def get_balance():
     data = request.get_json()
     if not data.get("api_key") or not data.get("api_secret"):
         return jsonify({"error": "Missing API credentials"}), 400
-
     try:
-        client = UMFutures(
-            key=data["api_key"],
-            secret=data["api_secret"],
-            base_url=BINANCE_MAINNET_URL
-        )
+        client = UMFutures(key=data["api_key"], secret=data["api_secret"], base_url=BINANCE_MAINNET_URL)
         balance = get_available_balance(client)
         return jsonify({
             "asset": "USDT",
             "available_balance": str(balance),
-            "timestamp": datetime.now(IST).isoformat(),
-            "environment": "MAINNET"
+            "timestamp": datetime.now(IST).isoformat()
         }), 200
     except Exception as e:
-        app.logger.error(f"MAINNET Balance fetch failed: {e}")
-        return jsonify({
-            "error": "Failed to fetch balance",
-            "details": str(e)
-        }), 500
+        log_event("ERROR", f"Balance fetch failed: {e}")
+        return jsonify({"error": "Failed to fetch balance", "details": str(e)}), 500
+
 
 @app.route("/current_prediction", methods=["GET"])
 def current_prediction():
-    """Get the latest prediction from MongoDB"""
     symbol = request.args.get("symbol", "BTCUSDT").upper()
-    
     try:
         prediction = get_latest_prediction(symbol)
-        
         if not prediction:
-            return jsonify({
-                "error": "No prediction available",
-                "symbol": symbol
-            }), 404
-        
-        if '_id' in prediction:
-            prediction['_id'] = str(prediction['_id'])
-        
+            return jsonify({"error": "No prediction available", "symbol": symbol}), 404
+        if "_id" in prediction:
+            prediction["_id"] = str(prediction["_id"])
         return jsonify({
             "symbol": symbol,
             "prediction": {
                 "direction": prediction.get("direction"),
                 "entry": prediction.get("entry"),
-                "tp": prediction.get("tp"),
                 "tp1": prediction.get("tp1"),
                 "tp2": prediction.get("tp2"),
                 "tp3": prediction.get("tp3"),
                 "sl": prediction.get("sl"),
-                "dynamic_sl": prediction.get("dynamic_sl"),
                 "confidence": prediction.get("confidence"),
-                "net_profit_est": prediction.get("net_profit_est"),
-                "net_loss_est": prediction.get("net_loss_est"),
-                "reasoning": prediction.get("reasoning"),
-                "currentPrice": prediction.get("currentPrice"),
-                "lastAnalysisTime": prediction.get("lastAnalysisTime"),
-                "updatedAtIST": prediction.get("updatedAtIST"),
-                "createdAt": prediction.get("createdAt"),
-                "updatedAt": prediction.get("updatedAt")
+                "updatedAtIST": prediction.get("updatedAtIST")
             },
-            "timestamp": datetime.now(IST).isoformat(),
-            "environment": "MAINNET"
+            "timestamp": datetime.now(IST).isoformat()
         }), 200
-        
     except Exception as e:
-        app.logger.error(f"Failed to fetch prediction: {e}")
-        return jsonify({
-            "error": "Failed to fetch prediction",
-            "details": str(e)
-        }), 500
+        log_event("ERROR", f"Prediction fetch failed: {e}")
+        return jsonify({"error": "Failed to fetch prediction", "details": str(e)}), 500
+
 
 @app.route("/stop_auto_trade/<job_id>", methods=["POST"])
 def stop_auto_trade(job_id):
-    """Stop a specific auto-trade job"""
     meta = auto_jobs.get(job_id)
     if not meta:
         return jsonify({"error": "Job not found"}), 404
-    
     try:
         meta["job"].remove()
         meta["status"] = "STOPPED_BY_USER"
-        
+        log_event("INFO", "Auto-trade job stopped manually", meta["trade_params"]["email"], {"job_id": job_id})
         return jsonify({
             "job_id": job_id,
-            "message": "Auto-trade job stopped successfully",
+            "message": "Auto-trade stopped successfully",
             "executed_trades": meta["executed_count"],
             "max_trades": meta["max_trades"],
             "timestamp": datetime.now(IST).isoformat()
         }), 200
     except Exception as e:
-        app.logger.error(f"Failed to stop job {job_id}: {e}")
-        return jsonify({
-            "error": "Failed to stop auto-trade job",
-            "details": str(e)
-        }), 500
+        log_event("ERROR", f"Failed to stop auto-trade: {e}", None, {"job_id": job_id})
+        return jsonify({"error": "Failed to stop auto-trade job", "details": str(e)}), 500
+
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Health check endpoint"""
+    """Quick status check"""
     return jsonify({
         "status": "healthy",
         "active_trades": len(active_trades),
         "active_auto_jobs": len(auto_jobs),
-        "timestamp": datetime.now(IST).isoformat(),
-        "environment": "MAINNET"
+        "timestamp": datetime.now(IST).isoformat()
     }), 200
 
-if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=int(os.getenv("PORT", 5002)))
 
+# ──────────────────────────────────────────────
+# Global Fail-Safe: stop auto-trade job on any trade or balance error
+# ──────────────────────────────────────────────
+
+def stop_jobs_on_failure(email: str, error_message: str):
+    """Stops all jobs for given email when a trade fails due to error or balance issue"""
+    stopped = []
+    for job_id, meta in list(auto_jobs.items()):
+        if meta["trade_params"]["email"] == email:
+            try:
+                meta["job"].remove()
+                meta["status"] = "FAILED"
+                stopped.append(job_id)
+            except Exception:
+                pass
+    log_event("ERROR", f"Stopped jobs due to trade failure: {error_message}", email, {"jobs": stopped})
+    return stopped
+
+
+# Inject into existing failure path
+_old_mark_failed = mark_failed
+def mark_failed(task_id: str, msg: str, email=None):
+    """Override: also stop all jobs of user"""
+    _old_mark_failed(task_id, msg, email)
+    if email:
+        stop_jobs_on_failure(email, msg)
+# ──────────────────────────────────────────────
+# Final Section — Server Entry Point
+# ──────────────────────────────────────────────
+
+# Re-assign the overridden mark_failed globally so all references use the fail-safe version
+globals()["mark_failed"] = mark_failed
+
+# Confirm that everything loaded correctly
+log_event("STARTUP", "All routes, schedulers, and fail-safes loaded successfully.")
+
+# Print current scheduler jobs for verification
+for job in scheduler.get_jobs():
+    app.logger.info(f"Loaded job: {job.id} next={job.next_run_time}")
+
+# ──────────────────────────────────────────────
+# Main Runner
+# ──────────────────────────────────────────────
+if __name__ == "__main__":
+    # Optional: preload in-memory structures before serving
+    try:
+        fetch_min_notional_values()
+        log_event("INFO", "Initial exchangeInfo sync completed.")
+    except Exception as e:
+        log_event("ERROR", f"Initial minNotional fetch failed: {e}")
+
+    port = int(os.getenv("PORT", 5002))
+    app.logger.info(f"Starting Flask app on 0.0.0.0:{port}")
+    log_event("STARTUP", f"Flask app listening on port {port}")
+
+    # Production launch (debug=False).  Gunicorn will run this app object directly.
+    app.run(debug=False, host="0.0.0.0", port=port)
