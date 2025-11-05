@@ -20,6 +20,10 @@ IST = ZoneInfo("Asia/Kolkata")
 app = Flask(__name__)
 CORS(app)
 
+from flask_caching import Cache
+cache = Cache(app, config={'CACHE_TYPE': 'SimpleCache', 'CACHE_DEFAULT_TIMEOUT': 5})
+
+
 # MongoDB Setup
 MONGO_URI = "mongodb+srv://netmanconnect:eDxdS7AkkimNGJdi@cluster0.exzvao3.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 mongo_client = MongoClient(MONGO_URI)
@@ -747,41 +751,45 @@ def auto_trade_status(job_id):
     })
 
 @app.route("/auto_trade_status_by_email", methods=["POST"])
+@cache.cached(timeout=5, query_string=False)
 def auto_trade_status_by_email():
+    """Return all auto-trade jobs for a user, cached for 5 seconds."""
     data = request.get_json(force=True)
     email = data.get("email")
     if not email:
         return jsonify({"error": "Missing field: email"}), 400
 
-    results = []
-    for job_id, meta in auto_jobs.items():
-        if meta["trade_params"].get("email") == email:
-            results.append({
-                "job_id": job_id,
-                "symbol": meta["trade_params"]["symbol"],
-                "status": meta.get("status", "ACTIVE"),
-                "last_prediction": meta["last_prediction"],
-                "executed_trades": meta["executed_trades"],
-                "executed_count": meta["executed_count"],
-                "max_trades": meta["max_trades"],
-                "remaining_trades": meta["max_trades"] - meta["executed_count"],
-                "next_run_time": meta["job"].next_run_time.isoformat() if meta["job"].next_run_time else None,
-                "threshold": meta["threshold"]
-            })
+    results = [
+        {
+            "job_id": job_id,
+            "symbol": meta["trade_params"]["symbol"],
+            "status": meta.get("status", "ACTIVE"),
+            "last_prediction": meta["last_prediction"],
+            "executed_trades": meta["executed_trades"],
+            "executed_count": meta["executed_count"],
+            "max_trades": meta["max_trades"],
+            "remaining_trades": meta["max_trades"] - meta["executed_count"],
+            "next_run_time": meta["job"].next_run_time.isoformat()
+            if meta["job"].next_run_time else None,
+            "threshold": meta["threshold"],
+        }
+        for job_id, meta in auto_jobs.items()
+        if meta["trade_params"].get("email") == email
+    ]
 
     if not results:
-        return jsonify({
-            "email": email,
-            "jobs": [],
-            "message": "No active auto-trade jobs found"
-        }), 404
+        return jsonify(
+            {"email": email, "jobs": [], "message": "No active auto-trade jobs found"}
+        ), 404
 
-    return jsonify({
-        "email": email,
-        "jobs": results,
-        "count": len(results),
-        "environment": "MAINNET"
-    }), 200
+    return jsonify(
+        {
+            "email": email,
+            "jobs": results,
+            "count": len(results),
+            "environment": "MAINNET",
+        }
+    ), 200
 
 @app.route("/status/<task_id>", methods=["GET"])
 def get_status(task_id):
@@ -1040,3 +1048,4 @@ def health_check():
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=int(os.getenv("PORT", 5002)))
+
