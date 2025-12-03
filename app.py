@@ -1,7 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# AutoTrade Bot — Full Version (Part 1/5)
-# Includes: Mongo logs (mttrader.logs), fail-stop on trade error, no first-signal skip,
-# cached /auto_trade_status_by_email, and all original endpoints preserved.
+# AutoTrade Bot — Full Version (MAINNET)
+# Converted from TESTNET → MAINNET
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -42,7 +41,7 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["mttrader"]
 status_logs = db["trades"]
 predictions_collection = db["prediction"]
-logs_collection = db["logs"]  # <— central app logs (startup, shutdown, errors, info)
+logs_collection = db["logs"]
 
 # In-memory runtime registries
 task_results = {}
@@ -61,32 +60,21 @@ scheduler.start()
 # ──────────────────────────────────────────────
 # Logging Helper → writes to mttrader.logs
 # ──────────────────────────────────────────────
-# ──────────────────────────────────────────────
-# Logging Helper → writes to mttrader.logs (with email auto-capture)
-# ──────────────────────────────────────────────
-from flask import has_request_context, request, g
+from flask import has_request_context, request as flask_request, g
 
 def log_event(level: str, message: str, email: str = None, context: dict = None):
-    """
-    Store structured logs in MongoDB 'logs' collection.
-    Auto-detects email from current request (JSON body, query string, or Flask 'g')
-    if not provided explicitly.
-    """
+    """Store structured logs in MongoDB 'logs' collection."""
     try:
-        # Attempt auto-detection of email
         if not email and has_request_context():
-            # Try from JSON body
             try:
-                if request.is_json:
-                    data = request.get_json(silent=True)
+                if flask_request.is_json:
+                    data = flask_request.get_json(silent=True)
                     if data and "email" in data:
                         email = data["email"]
             except Exception:
                 pass
-            # Try from query parameters
             if not email:
-                email = request.args.get("email")
-            # Try from Flask g (if previously stored)
+                email = flask_request.args.get("email")
             if not email:
                 email = getattr(g, "email", None)
 
@@ -96,6 +84,7 @@ def log_event(level: str, message: str, email: str = None, context: dict = None)
             "message": message,
             "email": email or "UNKNOWN",
             "context": context or {},
+            "environment": "MAINNET"
         }
 
         logs_collection.insert_one(entry)
@@ -104,15 +93,13 @@ def log_event(level: str, message: str, email: str = None, context: dict = None)
     except Exception as e:
         app.logger.error(f"Failed to write to Mongo logs: {e}")
 
-# Startup / shutdown logs
-log_event("STARTUP", "AutoTrade bot started successfully.", email="SYSTEM")
+log_event("STARTUP", "AutoTrade bot (MAINNET) started successfully.", email="SYSTEM")
 
 def _on_shutdown():
     log_event("SHUTDOWN", "AutoTrade bot stopped gracefully.", email="SYSTEM")
 
 atexit.register(_on_shutdown)
 
-# Optional global error handler to ensure unhandled exceptions are logged
 @app.errorhandler(Exception)
 def _global_exception_handler(e):
     log_event("ERROR", f"Unhandled exception: {str(e)}", context={"type": type(e).__name__})
@@ -121,21 +108,95 @@ def _global_exception_handler(e):
 # ──────────────────────────────────────────────
 # MAINNET CONFIGURATION
 # ──────────────────────────────────────────────
-BINANCE_MAINNET_URL = "https://fapi.binance.com"
-BINANCE_MAINNET_API_URL = "https://fapi.binance.com"
+# Binance USDT-M Futures mainnet endpoint
+BINANCE_API_URL = "https://fapi.binance.com"
 
-# Minimum notional per symbol (updated hourly from exchangeInfo)
 min_order_values = {
-    'BTCUSDT': Decimal('10'),
-    'ETHUSDT': Decimal('10'),
-    'DEFAULT': Decimal('10')
+    'BTCUSDT': Decimal('5'),
+    'ETHUSDT': Decimal('5'),
+    'DEFAULT': Decimal('5')
 }
 
-# Simple in-memory price cache
 current_prices = {
     'BTCUSDT': Decimal('0'),
     'ETHUSDT': Decimal('0')
 }
+
+# ──────────────────────────────────────────────
+# NEW: Position and Leverage Management
+# ──────────────────────────────────────────────
+
+def get_position_info(client, symbol: str) -> dict:
+    """Get current position information for a symbol."""
+    try:
+        positions = client.get_position_risk(symbol=symbol)
+        for pos in positions:
+            if pos['symbol'] == symbol:
+                return {
+                    'position_amt': Decimal(pos.get('positionAmt', '0')),
+                    'leverage': int(pos.get('leverage', 1)),  # <-- FIXED (default to 1)
+                    'entry_price': Decimal(pos.get('entryPrice', '0') if pos.get('entryPrice') != '0.0' else '0'),
+                    'unrealized_pnl': Decimal(pos.get('unRealizedProfit', '0'))
+                }
+
+        return {'position_amt': Decimal('0'), 'leverage': 1, 'entry_price': Decimal('0'), 'unrealized_pnl': Decimal('0')}
+    except Exception as e:
+        app.logger.error(f"Failed to get position info for {symbol}: {e}")
+        return {'position_amt': Decimal('0'), 'leverage': 1, 'entry_price': Decimal('0'), 'unrealized_pnl': Decimal('0')}
+
+
+def safe_change_leverage(client, symbol: str, leverage: int, email: str = None) -> bool:
+    """
+    Safely change leverage with proper error handling.
+    Returns True if successful, False if failed.
+    """
+    try:
+        # First check if there's an open position
+        position_info = get_position_info(client, symbol)
+        
+        if position_info['position_amt'] != 0:
+            # Position exists - check if we're trying to reduce leverage
+            current_leverage = position_info['leverage']
+            
+            if leverage < current_leverage:
+                app.logger.warning(
+                    f"Cannot reduce leverage from {current_leverage}x to {leverage}x "
+                    f"with open position. Keeping current leverage."
+                )
+                log_event("WARNING", 
+                    f"Leverage reduction skipped (open position exists): {current_leverage}x -> {leverage}x",
+                    email=email,
+                    context={"symbol": symbol, "position_amt": str(position_info['position_amt'])})
+                return False
+            elif leverage == current_leverage:
+                app.logger.info(f"Leverage already set to {leverage}x for {symbol}")
+                return True
+        
+        # Safe to change leverage (no position OR increasing leverage OR new position)
+        client.change_leverage(symbol=symbol, leverage=leverage)
+        app.logger.info(f"Successfully changed leverage to {leverage}x for {symbol}")
+        log_event("INFO", f"Leverage changed to {leverage}x", email=email, context={"symbol": symbol})
+        return True
+        
+    except Exception as e:
+        error_str = str(e)
+        
+        # Handle specific Binance error codes
+        if '-4161' in error_str:
+            app.logger.warning(
+                f"Binance error -4161: Cannot reduce leverage with open position for {symbol}. "
+                f"Continuing with current leverage."
+            )
+            log_event("WARNING", 
+                "Leverage change blocked by Binance (open position)", 
+                email=email,
+                context={"symbol": symbol, "requested_leverage": leverage, "error": "E-4161"})
+            return False
+        else:
+            # Other errors should be logged and handled
+            app.logger.error(f"Failed to change leverage for {symbol}: {e}")
+            log_event("ERROR", f"Leverage change failed: {e}", email=email, context={"symbol": symbol})
+            raise  # Re-raise for critical errors
 
 # ──────────────────────────────────────────────
 # Utility Functions
@@ -162,10 +223,7 @@ def get_available_balance(client) -> Decimal:
     raise ValueError("USDT balance not found")
 
 def get_symbol_precision_and_step_size(client, symbol: str) -> tuple:
-    """
-    Read exchange_info and return (decimals, step_size) for LOT_SIZE filter.
-    Fallback: (4, 0.0001) if symbol not found.
-    """
+    """Read exchange_info and return (decimals, step_size) for LOT_SIZE filter."""
     info = client.exchange_info()
     for s in info['symbols']:
         if s['symbol'] == symbol:
@@ -179,6 +237,16 @@ def get_symbol_precision_and_step_size(client, symbol: str) -> tuple:
 def truncate_to_step(quantity: Decimal, step_size: Decimal) -> Decimal:
     """Floor quantity to exchange LOT_SIZE step."""
     return (quantity // step_size) * step_size
+
+def ceil_to_step(quantity: Decimal, step_size: Decimal) -> Decimal:
+    """Ceil quantity to the nearest LOT_SIZE step (so notional meets MIN_NOTIONAL)."""
+    if step_size == 0:
+        return quantity
+    # Compute multiplier = ceil(quantity / step_size)
+    multiplier = (quantity / step_size).to_integral_value(rounding=ROUND_DOWN)
+    if multiplier * step_size < quantity:
+        multiplier = multiplier + Decimal(1)
+    return multiplier * step_size
 
 def get_min_tradable_qty(client, symbol: str) -> Decimal:
     """Compute min tradable qty from min notional and current price (floored to step)."""
@@ -194,11 +262,7 @@ def get_min_tradable_qty(client, symbol: str) -> Decimal:
     return Decimal('0.0001')
 
 def calculate_trade_quantity(client, symbol: str, size_usdt: Decimal) -> tuple:
-    """
-    Returns (qty, adjusted_size, was_adjusted)
-    - Floors qty to step & respects min notional
-    - If size below min, returns min qty and adjusted_size
-    """
+    """Returns (qty, adjusted_size, was_adjusted)"""
     price = fetch_price_with_retries(client, symbol)
     min_qty = get_min_tradable_qty(client, symbol)
     decimals, step_size = get_symbol_precision_and_step_size(client, symbol)
@@ -218,9 +282,9 @@ def calculate_trade_quantity(client, symbol: str, size_usdt: Decimal) -> tuple:
     return quantity, size_usdt, False
 
 def fetch_min_notional_values():
-    """Fetch MIN_NOTIONAL from exchangeInfo hourly for BTC/ETH (extend as needed)."""
+    """Fetch MIN_NOTIONAL from exchangeInfo hourly for BTC/ETH."""
     try:
-        res = requests.get(f'{BINANCE_MAINNET_API_URL}/fapi/v1/exchangeInfo', timeout=5)
+        res = requests.get(f'{BINANCE_API_URL}/fapi/v1/exchangeInfo', timeout=5)
         data = res.json()
         for symbol in ['BTCUSDT', 'ETHUSDT']:
             symbol_info = next((s for s in data['symbols'] if s['symbol'] == symbol), None)
@@ -230,18 +294,14 @@ def fetch_min_notional_values():
                     min_order_values[symbol] = Decimal(filter_info['notional'])
                     app.logger.info(f"Updated min notional for {symbol}: {min_order_values[symbol]}")
     except Exception as e:
-        app.logger.error(f"Failed to fetch min notional values: {e}")
-        log_event("ERROR", "Failed to fetch min notional values", context={"error": str(e)})
+        app.logger.error(f"Failed to fetch min notional values (MAINNET): {e}")
+        log_event("ERROR", "Failed to fetch min notional values (MAINNET)", context={"error": str(e)})
 
-# Initial fetch and hourly refresh
 fetch_min_notional_values()
 scheduler.add_job(fetch_min_notional_values, 'interval', hours=1)
 
 def mark_failed(task_id: str, msg: str, email=None):
-    """
-    Mark a running trade task as FAILED (db + memory), and free active_trades[email].
-    Also writes to logs collection.
-    """
+    """Mark a running trade task as FAILED (db + memory), and free active_trades[email]."""
     try:
         status_logs.update_one({"task_id": task_id}, {"$set": {
             "status": "FAILED", "error_message": msg, "end_time": datetime.now(IST)
@@ -257,7 +317,7 @@ def mark_failed(task_id: str, msg: str, email=None):
     log_event("ERROR", f"Trade task failed: {msg}", email=email, context={"task_id": task_id})
 
 def get_next_15min_interval() -> datetime:
-    """Get next 15-minute boundary (IST): e.g., 9:00, 9:15, 9:30, 9:45."""
+    """Get next 15-minute boundary (IST)."""
     now = datetime.now(IST)
     minutes = now.minute
     next_interval_minutes = ((minutes // 15) + 1) * 15
@@ -300,7 +360,7 @@ def parse_prediction_direction(prediction: dict) -> str:
     return None
 
 # ──────────────────────────────────────────────
-# Enhanced Trading Logic with TP1/TP2/TP3
+# FIXED: Enhanced Trading Logic with TP1/TP2/TP3
 # ──────────────────────────────────────────────
 def auto_trade_with_tps(
     client, symbol, qty, tp_levels, sl_price, leverage, task_id,
@@ -308,19 +368,14 @@ def auto_trade_with_tps(
 ):
     """
     Enhanced trading loop with multiple take-profit levels and breakeven logic.
-    tp_levels example:
-        {
-          "tp1": {"price": Decimal, "qty_pct": 33},
-          "tp2": {"price": Decimal, "qty_pct": 33},
-          "tp3": {"price": Decimal, "qty_pct": 34},
-        }
+    FIXED: Proper leverage change handling with position checking.
     """
     try:
-        # If an entry target is provided, wait up to 5 minutes to get filled around it
+        # If an entry target is provided, wait up to 5 minutes
         if entry_price_target:
             app.logger.info(f"{task_id}: Waiting for entry price {entry_price_target} ({direction})")
             wait_count = 0
-            max_wait = 300  # 5 minutes
+            max_wait = 300
             while wait_count < max_wait:
                 current_price = fetch_price_with_retries(client, symbol)
                 if (direction == "BUY" and current_price <= entry_price_target) or \
@@ -330,21 +385,51 @@ def auto_trade_with_tps(
                 wait_count += 1
 
         entry_price = fetch_price_with_retries(client, symbol)
-        client.change_leverage(symbol=symbol, leverage=leverage)
+        
+        # FIXED: Safe leverage change with error handling
+        leverage_changed = safe_change_leverage(client, symbol, leverage, email)
+        if not leverage_changed:
+            app.logger.warning(f"{task_id}: Continuing with existing leverage due to open position")
 
-        decimals = 9 if symbol == 'BTCUSDT' else 4
+        # Determine symbol precision and step
+        decimals, step_size = get_symbol_precision_and_step_size(client, symbol)
+
+        # Normalize qty to Decimal and floor to LOT_SIZE step
+        try:
+            qty = Decimal(qty)
+        except Exception:
+            return mark_failed(task_id, "Invalid quantity format", email=email)
+
+        # Ensure order notional >= exchange minimum (100 USDT on Binance futures) for opening (non-reduce) orders
+        MIN_NOTIONAL = Decimal('100')
+        notional = qty * entry_price
+        if notional < MIN_NOTIONAL:
+            # compute minimum quantity to meet min notional
+            min_qty = truncate_to_step((MIN_NOTIONAL / entry_price), step_size)
+            if min_qty <= 0:
+                return mark_failed(task_id, "Computed min order qty is zero; cannot place order", email=email)
+
+            qty = min_qty
+            app.logger.warning(f"{task_id}: Adjusted qty to meet min notional: qty={qty}, notional={qty * entry_price}")
+            log_event("WARNING", f"Adjusted qty to meet min notional: {qty * entry_price}", email=email,
+                      context={"task_id": task_id, "symbol": symbol})
+
         qty_str = "{0:.{1}f}".format(float(qty), decimals)
 
-        # Open market position
-        client.new_order(
-            symbol=symbol,
-            side=direction,
-            type='MARKET',
-            quantity=qty_str
-        )
-        app.logger.info(f"{task_id}: Entered {direction} {qty_str} {symbol} @ {entry_price}")
-        log_event("INFO", f"Entered position {direction} {symbol}", email=email,
-                  context={"task_id": task_id, "qty": qty_str, "entry": str(entry_price)})
+        # Open market position (fail-safe with proper logging)
+        try:
+            client.new_order(
+                symbol=symbol,
+                side=direction,
+                type='MARKET',
+                quantity=qty_str
+            )
+            app.logger.info(f"{task_id}: Entered {direction} {qty_str} {symbol} @ {entry_price}")
+            log_event("INFO", f"Entered position {direction} {symbol}", email=email,
+                      context={"task_id": task_id, "qty": qty_str, "entry": str(entry_price)})
+        except Exception as e:
+            app.logger.error(f"{task_id}: Open position failed: {e}")
+            return mark_failed(task_id, str(e), email=email)
 
         # Record entry in DB
         try:
@@ -360,7 +445,6 @@ def auto_trade_with_tps(
             app.logger.error(f"{task_id}: Failed to write entry to Mongo: {e}")
 
     except Exception as e:
-        # Opening trade failed → mark FAILED and exit
         log_event("ERROR", f"Open position failed: {e}", email=email, context={"task_id": task_id})
         return mark_failed(task_id, str(e), email=email)
 
@@ -372,94 +456,89 @@ def auto_trade_with_tps(
     breakeven_moved = False
 
     step = 0
-    max_steps = 86400  # 24h safety cutoff
+    max_steps = 3600 
 
     while True:
+        exit_reason = None
+        exit_qty = Decimal(0)
+
+        # fetch current price each loop
+        try:
+            price = fetch_price_with_retries(client, symbol)
+        except Exception as e:
+            app.logger.error(f"{task_id}: Price fetch failed inside loop: {e}")
+            price = Decimal(0)
+
+        # Check for cancel request
         if cancel_flags.get(task_id):
             exit_reason = "CANCELLED_BY_USER"
             exit_qty = remaining_qty
         else:
-            try:
-                price = fetch_price_with_retries(client, symbol)
-            except Exception as e:
-                log_event("ERROR", f"Price fetch failed in loop: {e}", email=email, context={"task_id": task_id})
-                return mark_failed(task_id, str(e), email=email)
+            # Iterate TP levels and close partial positions when hit
+            for tp_name in ["tp1", "tp2", "tp3"]:
+                if tp_name not in tp_levels or tp_name in tp_hits:
+                    continue
 
-            exit_reason = None
-            exit_qty = None
+                tp_data = tp_levels[tp_name]
+                tp_price = tp_data["price"]
+                tp_qty_pct = tp_data["qty_pct"]
 
-            # Check SL (directional)
-            if direction == "BUY":
-                if price <= current_sl:
-                    exit_reason = "STOPPED_LOSS"
-                    exit_qty = remaining_qty
-            else:  # SELL
-                if price >= current_sl:
-                    exit_reason = "STOPPED_LOSS"
-                    exit_qty = remaining_qty
+                hit = (direction == "BUY" and price >= tp_price) or (direction == "SELL" and price <= tp_price)
+                if not hit:
+                    continue
 
-            # TPs sequential
-            if not exit_reason:
-                for tp_name in ["tp1", "tp2", "tp3"]:
-                    if tp_name not in tp_levels or tp_name in tp_hits:
-                        continue
+                partial_qty = truncate_to_step(qty * Decimal(tp_qty_pct) / Decimal(100), step_size)
+                if partial_qty > remaining_qty:
+                    partial_qty = remaining_qty
 
-                    tp_data = tp_levels[tp_name]
-                    tp_price = tp_data["price"]
-                    tp_qty_pct = tp_data["qty_pct"]
+                if partial_qty <= 0:
+                    app.logger.warning(f"{task_id}: Computed partial_qty is zero, skipping {tp_name}")
+                    continue
 
-                    hit = (direction == "BUY" and price >= tp_price) or (direction == "SELL" and price <= tp_price)
-                    if hit:
-                        # Partial close
-                        partial_qty = truncate_to_step(qty * Decimal(tp_qty_pct) / Decimal(100), step_size)
-                        if partial_qty > remaining_qty:
-                            partial_qty = remaining_qty
+                try:
+                    partial_qty_str = "{0:.{1}f}".format(float(partial_qty), decimals)
+                    client.new_order(
+                        symbol=symbol,
+                        side="SELL" if direction == "BUY" else "BUY",
+                        type='MARKET',
+                        quantity=partial_qty_str,
+                        reduceOnly=True
+                    )
 
-                        if partial_qty > 0:
-                            try:
-                                partial_qty_str = "{0:.{1}f}".format(float(partial_qty), (9 if symbol == 'BTCUSDT' else 4))
-                                client.new_order(
-                                    symbol=symbol,
-                                    side="SELL" if direction == "BUY" else "BUY",
-                                    type='MARKET',
-                                    quantity=partial_qty_str,
-                                    reduceOnly=True
-                                )
+                    remaining_qty -= partial_qty
+                    tp_hits.append(tp_name)
+                    app.logger.info(f"{task_id}: {tp_name} HIT at {price}. Closed {partial_qty_str}, Remaining: {remaining_qty}")
+                    log_event("INFO", f"{tp_name} hit", email=email,
+                              context={"task_id": task_id, "price": str(price), "partial_qty": partial_qty_str})
 
-                                remaining_qty -= partial_qty
-                                tp_hits.append(tp_name)
-                                app.logger.info(f"{task_id}: {tp_name} HIT at {price}. Closed {partial_qty_str}, Remaining: {remaining_qty}")
-                                log_event("INFO", f"{tp_name} hit", email=email,
-                                          context={"task_id": task_id, "price": str(price), "partial_qty": partial_qty_str})
+                    # Move SL to breakeven after TP1
+                    if tp_name == "tp1" and not breakeven_moved:
+                        current_sl = entry_price
+                        breakeven_moved = True
+                        app.logger.info(f"{task_id}: Stop loss moved to breakeven at {entry_price}")
 
-                                # Move SL to breakeven after TP1
-                                if tp_name == "tp1" and not breakeven_moved:
-                                    current_sl = entry_price
-                                    breakeven_moved = True
-                                    app.logger.info(f"{task_id}: Stop loss moved to breakeven at {entry_price}")
+                    # DB TP hit
+                    try:
+                        status_logs.update_one(
+                            {"task_id": task_id},
+                            {"$push": {"tp_hits": {
+                                "level": tp_name,
+                                "price": str(price),
+                                "quantity": str(partial_qty),
+                                "time": datetime.now(IST).isoformat()
+                            }}} 
+                        )
+                    except Exception as e:
+                        app.logger.error(f"{task_id}: Failed to push TP hit to Mongo: {e}")
 
-                                # DB TP hit
-                                try:
-                                    status_logs.update_one(
-                                        {"task_id": task_id},
-                                        {"$push": {"tp_hits": {
-                                            "level": tp_name,
-                                            "price": str(price),
-                                            "quantity": str(partial_qty),
-                                            "time": datetime.now(IST).isoformat()
-                                        }}}
-                                    )
-                                except Exception as e:
-                                    app.logger.error(f"{task_id}: Failed to push TP hit to Mongo: {e}")
+                    if remaining_qty <= step_size:
+                        exit_reason = "ALL_TPS_COMPLETED"
+                        exit_qty = Decimal(0)
+                        break
 
-                                if remaining_qty <= step_size:
-                                    exit_reason = "ALL_TPS_COMPLETED"
-                                    exit_qty = Decimal(0)
-                                    break
-
-                            except Exception as e:
-                                app.logger.error(f"{task_id}: Error closing {tp_name}: {e}")
-                                log_event("ERROR", f"Error closing {tp_name}: {e}", email=email, context={"task_id": task_id})
+                except Exception as e:
+                    app.logger.error(f"{task_id}: Error closing {tp_name}: {e}")
+                    log_event("ERROR", f"Error closing {tp_name}: {e}", email=email, context={"task_id": task_id})
 
             # Forced cutoff after max_steps
             if step >= max_steps and not exit_reason:
@@ -473,8 +552,8 @@ def auto_trade_with_tps(
             # Close remaining if any
             if exit_qty and exit_qty > step_size:
                 try:
-                    decimals = 9 if symbol == 'BTCUSDT' else 4
-                    exit_qty_str = "{0:.{1}f}".format(float(exit_qty), decimals)
+                    decimals_exit = 9 if symbol == 'BTCUSDT' else 4
+                    exit_qty_str = "{0:.{1}f}".format(float(exit_qty), decimals_exit)
                     client.new_order(
                         symbol=symbol,
                         side="SELL" if direction == "BUY" else "BUY",
@@ -534,24 +613,15 @@ def auto_trade_with_tps(
         time.sleep(1)
 
 # ──────────────────────────────────────────────
-# (End of Part 1/5)
-# Next: poll_predict_and_trade, routes, fail-stop wiring, etc.
-# ──────────────────────────────────────────────
-# ──────────────────────────────────────────────
 # Polling + Auto-Trade Scheduling Logic
 # ──────────────────────────────────────────────
 
 def poll_predict_and_trade(job_id: str):
-    """
-    Periodically polls MongoDB predictions and initiates trades if threshold met.
-    Modified: removed 'skip first signal', stops the job entirely if trade or
-    balance error occurs (fail-safe).
-    """
+    """Periodically polls MongoDB predictions and initiates trades if threshold met."""
     meta = auto_jobs[job_id]
     email = meta["trade_params"]["email"]
     symbol = meta["trade_params"].get("symbol", "BTCUSDT").upper()
 
-    # Stop if max trades reached
     if meta["executed_count"] >= meta["max_trades"]:
         try:
             meta["job"].remove()
@@ -561,7 +631,6 @@ def poll_predict_and_trade(job_id: str):
             log_event("ERROR", f"Job stop error: {e}", email)
         return
 
-    # Avoid multiple concurrent trades for same email
     if email in active_trades:
         log_event("INFO", f"{email} already has an active trade", email)
         return
@@ -580,12 +649,10 @@ def poll_predict_and_trade(job_id: str):
         log_event("ERROR", f"Prediction fetch failed: {e}", email)
         return
 
-    # Proceed if threshold met
     if direction and confidence >= meta["threshold"]:
         payload = meta["trade_params"].copy()
         payload["direction"] = direction
 
-        # Add TP levels if present
         if all(k in prediction for k in ["tp1", "tp2", "tp3", "sl"]):
             payload["use_tp_levels"] = True
             payload["tp1"] = prediction["tp1"]
@@ -614,7 +681,10 @@ def poll_predict_and_trade(job_id: str):
                 log_event("ERROR", "Trade API returned failure, stopping job", email,
                           {"status": r.status_code, "text": r.text})
         except Exception as e:
-            meta["job"].remove()
+            try:
+                meta["job"].remove()
+            except Exception:
+                pass
             meta["status"] = "FAILED"
             log_event("ERROR", f"Trade request failed: {e}", email)
     else:
@@ -626,7 +696,7 @@ def poll_predict_and_trade(job_id: str):
 
 @app.route("/trade", methods=["POST"])
 def start_trade():
-    data = request.get_json(force=True)
+    data = flask_request.get_json(force=True)
     required_fields = ["email", "symbol", "leverage", "api_key", "api_secret", "size_usdt"]
     for f in required_fields:
         if f not in data:
@@ -637,17 +707,55 @@ def start_trade():
         return jsonify({"error": "You already have an active trade."}), 403
 
     try:
-        client = UMFutures(key=data["api_key"], secret=data["api_secret"], base_url=BINANCE_MAINNET_URL)
+        # Use MAINNET base URL for client
+        client = UMFutures(key=data["api_key"], secret=data["api_secret"], base_url=BINANCE_API_URL)
         size_usdt = Decimal(str(data["size_usdt"]))
         if size_usdt <= 0:
             return jsonify({"error": "Size must be positive"}), 400
+        
+        # Fetch symbol price first
+        symbol_price = current_prices.get(
+            data["symbol"],
+            fetch_price_with_retries(client, data["symbol"])
+        )
+        
+        # Calculate initial quantity and notional
+        qty = size_usdt / symbol_price
+        decimals, step = get_symbol_precision_and_step_size(client, data["symbol"])
+        qty = truncate_to_step(qty, step)
+        notional = qty * symbol_price
+        adjusted_size = size_usdt
+        was_adjusted = False
 
-        qty, adjusted_size, was_adjusted = calculate_trade_quantity(client, data["symbol"], size_usdt)
+        # Adjust if notional is below minimum
+        if notional < Decimal('100'):
+            min_qty = ceil_to_step(Decimal('100') / symbol_price, step)
+            min_notional = min_qty * symbol_price
+
+            # Verify adjusted notional meets minimum
+            if min_notional < Decimal('100'):
+                msg = f"Cannot place order: required notional ${min_notional:.2f} still below $100 minimum for {data['symbol']}"
+                log_event("ERROR", msg, data["email"])
+                stop_jobs_on_failure(data["email"], msg)
+                return jsonify({"error": msg}), 400
+
+            qty = min_qty
+            adjusted_size = min_notional
+            was_adjusted = True
+
+            app.logger.warning(
+                f"Adjusted qty to meet Binance min notional: qty={qty}, notional={adjusted_size}"
+            )
+
+
         bal = get_available_balance(client)
         required = adjusted_size / Decimal(data["leverage"])
         if bal < required:
             msg = f"Insufficient balance: need {required:.2f}, have {bal:.2f}"
+            
             log_event("ERROR", msg, email)
+            # Stop user's auto-trade jobs on failure
+            stop_jobs_on_failure(email, msg)
             return jsonify({"error": msg}), 400
 
         task_id = str(uuid.uuid4())
@@ -709,9 +817,12 @@ def start_trade():
         def simple_auto_trade():
             try:
                 entry_price = fetch_price_with_retries(client, data["symbol"])
-                client.change_leverage(symbol=data["symbol"], leverage=int(data["leverage"]))
-                decimals = 9 if data["symbol"] == 'BTCUSDT' else 4
-                qty_str = f"{float(qty):.{decimals}f}"
+                
+                # FIXED: Use safe leverage change
+                safe_change_leverage(client, data["symbol"], int(data["leverage"]), email)
+                
+                decimals_local = 9 if data["symbol"] == 'BTCUSDT' else 4
+                qty_str = f"{float(qty):.{decimals_local}f}"
 
                 client.new_order(symbol=data["symbol"], side=direction, type='MARKET', quantity=qty_str)
                 profit_pct = Decimal(str(data["profit_percent"]))
@@ -755,13 +866,14 @@ def start_trade():
     except Exception as e:
         log_event("ERROR", f"Trade init failed: {e}", email)
         return jsonify({"error": "Trade initialization failed", "details": str(e)}), 502
+
 # ──────────────────────────────────────────────
 # Auto-Trade Job Scheduling Endpoints
 # ──────────────────────────────────────────────
 
 @app.route("/start_auto_trade", methods=["POST"])
 def start_auto_trade():
-    data = request.get_json(force=True)
+    data = flask_request.get_json(force=True)
     required_fields = ["email", "symbol", "size_usdt", "leverage", "api_key", "api_secret", "threshold"]
     for f in required_fields:
         if f not in data:
@@ -843,7 +955,7 @@ def auto_trade_status(job_id):
 @cache.cached(timeout=5, query_string=False)
 def auto_trade_status_by_email():
     """Return all jobs for an email, cached 5s"""
-    data = request.get_json(force=True)
+    data = flask_request.get_json(force=True)
     email = data.get("email")
     if not email:
         return jsonify({"error": "Missing field: email"}), 400
@@ -862,6 +974,7 @@ def auto_trade_status_by_email():
     if not results:
         return jsonify({"email": email, "jobs": [], "message": "No jobs found"}), 404
     return jsonify({"email": email, "jobs": results, "count": len(results)}), 200
+
 
 # ──────────────────────────────────────────────
 # Trade Status & Cancel Operations
@@ -909,7 +1022,7 @@ def stop_auto_trade_jobs_by_email(email: str):
 
 @app.route("/cancel_by_email", methods=["POST"])
 def cancel_by_email():
-    data = request.get_json(force=True)
+    data = flask_request.get_json(force=True)
     email = data.get("email")
     if not email:
         return jsonify({"error": "Missing email"}), 400
@@ -930,6 +1043,7 @@ def cancel_by_email():
         "stopped_auto_trade_jobs": stopped_job_ids,
         "message": f"Cancelled {len(tids)} trades and stopped {len(stopped_job_ids)} jobs"
     }), 202
+
 # ──────────────────────────────────────────────
 # Emergency Stop, Price, Balance, and Prediction APIs
 # ──────────────────────────────────────────────
@@ -965,16 +1079,17 @@ def emergency_stop():
 
 @app.route("/price", methods=["GET"])
 def price():
-    sym = request.args.get("symbol", "BTCUSDT").upper()
+    sym = flask_request.args.get("symbol", "BTCUSDT").upper()
     try:
-        res = requests.get(f"{BINANCE_MAINNET_API_URL}/fapi/v1/ticker/price?symbol={sym}", timeout=5)
+        res = requests.get(f"{BINANCE_API_URL}/fapi/v1/ticker/price?symbol={sym}", timeout=5)
         res.raise_for_status()
-        price = Decimal(res.json()["price"])
-        current_prices[sym] = price
+        price_val = Decimal(res.json()["price"])
+        current_prices[sym] = price_val
         return jsonify({
             "symbol": sym,
-            "price": str(price),
-            "timestamp": datetime.now(IST).isoformat()
+            "price": str(price_val),
+            "timestamp": datetime.now(IST).isoformat(),
+            "environment": "MAINNET"
         }), 200
     except Exception as e:
         log_event("ERROR", f"Price fetch failed: {e}", None, {"symbol": sym})
@@ -983,16 +1098,17 @@ def price():
 
 @app.route("/balance", methods=["POST"])
 def get_balance():
-    data = request.get_json()
+    data = flask_request.get_json()
     if not data.get("api_key") or not data.get("api_secret"):
         return jsonify({"error": "Missing API credentials"}), 400
     try:
-        client = UMFutures(key=data["api_key"], secret=data["api_secret"], base_url=BINANCE_MAINNET_URL)
+        client = UMFutures(key=data["api_key"], secret=data["api_secret"], base_url=BINANCE_API_URL)
         balance = get_available_balance(client)
         return jsonify({
             "asset": "USDT",
             "available_balance": str(balance),
-            "timestamp": datetime.now(IST).isoformat()
+            "timestamp": datetime.now(IST).isoformat(),
+            "environment": "MAINNET"
         }), 200
     except Exception as e:
         log_event("ERROR", f"Balance fetch failed: {e}")
@@ -1001,7 +1117,7 @@ def get_balance():
 
 @app.route("/current_prediction", methods=["GET"])
 def current_prediction():
-    symbol = request.args.get("symbol", "BTCUSDT").upper()
+    symbol = flask_request.args.get("symbol", "BTCUSDT").upper()
     try:
         prediction = get_latest_prediction(symbol)
         if not prediction:
@@ -1020,7 +1136,8 @@ def current_prediction():
                 "confidence": prediction.get("confidence"),
                 "updatedAtIST": prediction.get("updatedAtIST")
             },
-            "timestamp": datetime.now(IST).isoformat()
+            "timestamp": datetime.now(IST).isoformat(),
+            "environment": "MAINNET"
         }), 200
     except Exception as e:
         log_event("ERROR", f"Prediction fetch failed: {e}")
@@ -1055,7 +1172,8 @@ def health_check():
         "status": "healthy",
         "active_trades": len(active_trades),
         "active_auto_jobs": len(auto_jobs),
-        "timestamp": datetime.now(IST).isoformat()
+        "timestamp": datetime.now(IST).isoformat(),
+        "environment": "MAINNET"
     }), 200
 
 
@@ -1080,22 +1198,21 @@ def stop_jobs_on_failure(email: str, error_message: str):
 
 # Inject into existing failure path
 _old_mark_failed = mark_failed
-def mark_failed(task_id: str, msg: str, email=None):
+def mark_failed_with_job_stop(task_id: str, msg: str, email=None):
     """Override: also stop all jobs of user"""
     _old_mark_failed(task_id, msg, email)
     if email:
         stop_jobs_on_failure(email, msg)
+
+# Re-assign globally
+mark_failed = mark_failed_with_job_stop
+
 # ──────────────────────────────────────────────
 # Final Section — Server Entry Point
 # ──────────────────────────────────────────────
 
-# Re-assign the overridden mark_failed globally so all references use the fail-safe version
-globals()["mark_failed"] = mark_failed
+log_event("STARTUP", "All routes, schedulers, and fail-safes loaded successfully.", email="SYSTEM")
 
-# Confirm that everything loaded correctly
-log_event("STARTUP", "All routes, schedulers, and fail-safes loaded successfully.")
-
-# Print current scheduler jobs for verification
 for job in scheduler.get_jobs():
     app.logger.info(f"Loaded job: {job.id} next={job.next_run_time}")
 
@@ -1103,17 +1220,14 @@ for job in scheduler.get_jobs():
 # Main Runner
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    # Optional: preload in-memory structures before serving
     try:
         fetch_min_notional_values()
-        log_event("INFO", "Initial exchangeInfo sync completed.")
+        log_event("INFO", "Initial exchangeInfo sync completed (MAINNET).")
     except Exception as e:
-        log_event("ERROR", f"Initial minNotional fetch failed: {e}")
+        log_event("ERROR", f"Initial minNotional fetch failed (MAINNET): {e}")
 
     port = int(os.getenv("PORT", 5002))
-    app.logger.info(f"Starting Flask app on 0.0.0.0:{port}")
-    log_event("STARTUP", f"Flask app listening on port {port}")
+    app.logger.info(f"Starting Flask app (MAINNET) on 0.0.0.0:{port}")
+    log_event("STARTUP", f"Flask app (MAINNET) listening on port {port}", email="SYSTEM")
 
-    # Production launch (debug=False).  Gunicorn will run this app object directly.
     app.run(debug=False, host="0.0.0.0", port=port)
-
